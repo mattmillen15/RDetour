@@ -1,0 +1,6 @@
+
+[20:49:56] === lifetime probe start ===
+[20:49:57] B/600s tunnel up (cycle every 600s)
+[20:49:57] A/120s tunnel up (cycle every 120s)
+[20:51:57] A/120s#1 cycle ok=True banner=b'SSH-2.0-OpenSSH_10.0'
+[20:53:57] A/120s#2 cycle ok=True banner=b'SSH-2.0-OpenSSH_10.0'

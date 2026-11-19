@@ -1,0 +1,4 @@
+Duo Authentication for Remote Desktop Gateway uses the following open-source components:
+    Component       License File
+    LibJSON         libjson-license.txt
+    jsoncpp         jsoncpp-license.txt
