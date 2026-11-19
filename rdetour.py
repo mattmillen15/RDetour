@@ -228,7 +228,11 @@ class RawTLS:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.tls = ctx.wrap_socket(self.sock, server_hostname=host)
+        try:
+            self.tls = ctx.wrap_socket(self.sock, server_hostname=host)
+        except Exception:
+            self.sock.close()
+            raise
         self.tls.settimeout(timeout)
         self.buf = b""
         try:
@@ -279,6 +283,10 @@ class RawTLS:
             self.tls.close()
         except Exception:
             pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 
 class ChunkedReader:
@@ -310,8 +318,11 @@ class ChunkedReader:
                     if not d:
                         raise RDGProtocolError("EOF in chunk body")
                     self.pending += d
+                # extract chunk body, keep overflow, consume trailing CRLF
+                chunk = self.pending[:size]
                 self.pending = self.pending[size:]
-                self._read_line()
+                self._read_line()          # trailing CRLF after chunk body
+                self.pending = chunk + self.pending
             take = min(n - len(out), len(self.pending))
             out += self.pending[:take]
             self.pending = self.pending[take:]
@@ -1291,8 +1302,9 @@ class WarmSocksServer(SocksServer):
             else:
                 say("[warm] no SMB2 answer on gateway loopback — "
                     "fallback disabled")
-        except RDGError as e:
+        except (RDGError, ConnectionError, ssl.SSLError, OSError) as e:
             say("[warm] gateway fallback unavailable: %s" % e)
+            t.channel_open = False   # baseline channel is dead
             t.closed = True
             t.suspect = True       # discarded without a clean handshake
         return self.gw_guid
@@ -1533,7 +1545,12 @@ class WarmSocksServer(SocksServer):
 
                 rt = threading.Thread(target=reader, daemon=True)
                 rt.start()
-                client.settimeout(None)
+                client.settimeout(15)    # reader-stuck fix: sendall blocks
+                                         # forever when the SOCKS client
+                                         # disconnects mid-flow; 15s is
+                                         # generous for legit writes but
+                                         # well under the kernel's TCP
+                                         # retransmit timeout (~2min)
                 if sniff:                # the multi-dialect negotiate we held
                     wrote[0] = time.monotonic()
                     t.write(sniff)
@@ -1643,7 +1660,8 @@ class WarmSocksServer(SocksServer):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.args.socks_host, self.args.socks_port))
-        srv.listen(16)
+        srv.listen(512)   # nxc /24 opens 256 threads; backlog 16 RSTs the
+                          # 17th SYN and nxc reports live hosts as down
         print("[*] SOCKS5 %s:%d via %s:%d as %s — one approval per tunnel, "
               "sequential channels, SMB1 probes answered locally" %
               (self.args.socks_host, self.args.socks_port, self.args.gateway,
