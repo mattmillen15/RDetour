@@ -1491,7 +1491,7 @@ class WarmSocksServer(SocksServer):
                             _cmd = " SMB2 cmd=%d" % _smb2_cmd
                         elif len(d) > 8 and d[4:8] == b'\xffSMB':
                             _cmd = " SMB1"
-                        if _smb2_cmd >= 2 and not host_known:
+                        if _smb2_cmd >= 2 and not host_known and not life[0]:
                             say("[conn %d] writer: drop %d bytes%s "
                                 "(first-contact gate)" %
                                 (conn_id, len(d), _cmd))
