@@ -9,6 +9,7 @@ Protocol per [MS-TSGU] HTTP transport, cross-checked against FreeRDP rdg.c.
 """
 import argparse
 import base64
+import collections
 import hashlib
 import json
 import os
@@ -1130,6 +1131,48 @@ def save_kill_cache(gateway, entries):
         raise
 
 
+class _PriorityChannelQueue:
+    """Gives known-good hosts priority over unknown hosts for the channel."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._busy = False
+        self._pri_q = collections.deque()
+        self._norm_q = collections.deque()
+
+    def acquire(self, priority, timeout):
+        evt = threading.Event()
+        with self._lock:
+            if priority:
+                self._pri_q.append(evt)
+            else:
+                self._norm_q.append(evt)
+            self._maybe_grant()
+        got = evt.wait(timeout=timeout)
+        if not got:
+            with self._lock:
+                try:
+                    (self._pri_q if priority else self._norm_q).remove(evt)
+                except ValueError:
+                    if evt.is_set():
+                        self._busy = False
+                        self._maybe_grant()
+        return got
+
+    def release(self):
+        with self._lock:
+            self._busy = False
+            self._maybe_grant()
+
+    def _maybe_grant(self):
+        if self._busy:
+            return
+        q = self._pri_q or self._norm_q
+        if q:
+            self._busy = True
+            q.popleft().set()
+
+
 class WarmSocksServer(SocksServer):
     """SOCKS5 over one warm tunnel with channel cycling. One MFA push per
     tunnel lifetime. Connections are serialized (one channel at a time)."""
@@ -1139,6 +1182,7 @@ class WarmSocksServer(SocksServer):
         self.tunnel = None
         self.chan_lock = threading.Lock()
         self.tunnel_lock = threading.Lock()
+        self._chan_q = _PriorityChannelQueue()
         self.scout = None
         self.scout_factory = scout_factory or tunnel_factory
         self.scout_lock = threading.Lock()
@@ -1325,8 +1369,32 @@ class WarmSocksServer(SocksServer):
                     self._abort(client, replied, 0x05,
                                 "scout blocked — warm tunnel alive")
                     return
-            lock = self.scout_lock if is_scout else self.chan_lock
-            with lock:
+            is_priority = (not is_scout and host_known)
+            if is_scout:
+                lock = self.scout_lock
+                if not lock.acquire(timeout=8):
+                    self._abort(client, replied, 0x04,
+                                "channel queue full")
+                    return
+            else:
+                if not self._chan_q.acquire(is_priority, timeout=8):
+                    self._abort(client, replied, 0x04,
+                                "channel queue full")
+                    return
+                lock = None
+            try:
+                if not sniff:
+                    client.setblocking(False)
+                    try:
+                        peek = client.recv(1, socket.MSG_PEEK)
+                        if not peek:
+                            return
+                    except BlockingIOError:
+                        pass
+                    except (ConnectionError, OSError):
+                        return
+                    finally:
+                        client.setblocking(True)
                 if is_scout:
                     t = self._ensure_scout()
                     self.stats["scout_probes"] += 1
@@ -1386,6 +1454,8 @@ class WarmSocksServer(SocksServer):
                 wrote = [None]
                 life = [False]
                 auth_failed = [False]
+                stillborn = [False]
+                gw_loopback = [False]
                 t.drain_saw_data = False
 
                 def reader():
@@ -1413,6 +1483,7 @@ class WarmSocksServer(SocksServer):
                                 g = smb2_server_guid(snif)
                                 if g is not None and g == gw_guid:
                                     self.stats["gw_dead"] += 1
+                                    gw_loopback[0] = True
                                     say("[conn %d] %s:%d DEAD "
                                         "(landed on gateway loopback)" %
                                         (conn_id, host, port))
@@ -1430,18 +1501,12 @@ class WarmSocksServer(SocksServer):
                             elif (not life[0] and wrote[0] is not None and
                                   time.monotonic() - wrote[0] > STILLBORN_S):
                                 self.stats["stillborn"] += 1
-                                t.closed = True
-                                try:
-                                    t.close()
-                                except Exception:
-                                    pass
+                                stillborn[0] = True
                                 self._kill_remember(host, port, "stillborn")
-                                cached = ", cached local-refuse"
                                 say("[conn %d] %s:%d STILLBORN — granted but"
-                                    " silent %.1fs (refused port?): tunnel "
-                                    "discarded%s" %
-                                    (conn_id, host, port, STILLBORN_S,
-                                     cached))
+                                    " silent %.1fs (refused port?): cached"
+                                    " local-refuse" %
+                                    (conn_id, host, port, STILLBORN_S))
                                 try:
                                     client.shutdown(socket.SHUT_RDWR)
                                 except Exception:
@@ -1497,10 +1562,7 @@ class WarmSocksServer(SocksServer):
                 finally:
                     preempt_sent = False
                     _t0 = time.monotonic()
-                    if wrote[0] is None:
-                        say("[conn %d] empty channel — no data sent"
-                            % conn_id)
-                    elif not t.closed and not t._srv_closed_channel \
+                    if not t.closed and not t._srv_closed_channel \
                             and t.channel_open \
                             and hasattr(t, 'send_packet'):
                         try:
@@ -1518,6 +1580,14 @@ class WarmSocksServer(SocksServer):
                             "dead (reader saw abort)" % conn_id)
                     t.channel_open = False
                     rt.join(timeout=10)
+                    _no_real_traffic = (wrote[0] is None
+                                        or gw_loopback[0]
+                                        or stillborn[0]
+                                        or auth_failed[0])
+                    if _no_real_traffic and t.closed and preempt_sent:
+                        t.closed = False
+                        t.suspect = False
+                        t.last_close_abrupt = True
                     if rt.is_alive():
                         say("[conn %d] reader stuck — discarding tunnel" %
                             conn_id)
@@ -1525,10 +1595,16 @@ class WarmSocksServer(SocksServer):
                         t.suspect = True
                         t.close()
                     elif not t.closed and not t._srv_closed_channel:
-                        if preempt_sent:
+                        if stillborn[0]:
+                            p = t.recv_packet(timeout=1)
+                            if p and p[0] == 0x11:
+                                t.last_close_abrupt = False
+                            else:
+                                t.last_close_abrupt = True
+                        elif preempt_sent:
                             _blackhole = (wrote[0] is not None
                                           and not life[0])
-                            _drain_t = 30 if _blackhole else 5
+                            _drain_t = 30 if _blackhole else (1 if _no_real_traffic else 5)
                             if _blackhole:
                                 say("[conn %d] blackhole likely — waiting "
                                     "%ds for gateway TCP timeout"
@@ -1557,10 +1633,17 @@ class WarmSocksServer(SocksServer):
                                 t.closed = True
                                 t.suspect = True
                             else:
-                                say("[conn %d] drain: no ack after %ds "
-                                    "— tunnel dead" % (conn_id, _drain_t))
-                                t.closed = True
-                                t.suspect = True
+                                if _no_real_traffic or _blackhole:
+                                    say("[conn %d] drain: no ack after %ds "
+                                        "— channel lost" %
+                                        (conn_id, _drain_t))
+                                    t.last_close_abrupt = True
+                                else:
+                                    say("[conn %d] drain: no ack after %ds "
+                                        "— tunnel dead" %
+                                        (conn_id, _drain_t))
+                                    t.closed = True
+                                    t.suspect = True
                             if _blackhole:
                                 if self._kill_remember(
                                         host, port,
@@ -1622,6 +1705,11 @@ class WarmSocksServer(SocksServer):
                     say("[conn %d] channel %s:%d closed — %s %s%s" %
                         (conn_id, host, port, tl,
                          "dead" if t.closed else "stays warm", why))
+            finally:
+                if lock is not None:
+                    lock.release()
+                else:
+                    self._chan_q.release()
         except MfaNotApproved as e:
             self.stats["failed"] += 1
             self._abort(client, replied, 0x02, "mfa not approved: %s" % e)

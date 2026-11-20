@@ -660,8 +660,8 @@ def test_smb1_probe_answered_locally():
 
 def test_stillborn_discard_and_cache():
     """A granted-but-silent 445 channel (refused port) is detected after
-    STILLBORN_S: client RST, tunnel discarded, and the host answered
-    locally (SOCKS refused) on every later connection — no second tunnel."""
+    STILLBORN_S: client RST, host cached, and answered locally (SOCKS
+    refused) on every later connection — tunnel stays alive."""
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11985", "--no-gw-fallback",
                                "--no-scout"])
@@ -715,7 +715,8 @@ def test_stillborn_discard_and_cache():
         assert made == [1], made
         assert srv.stats["stillborn"] == 1, srv.stats
         assert "10.7.7.7:445" in srv.kill_cache
-        assert srv.tunnel is None or srv.tunnel.closed, "tunnel discarded"
+        assert srv.tunnel is not None and not srv.tunnel.closed, \
+            "tunnel must survive stillborn"
 
         # second connection to the same host: refused locally, no tunnel
         c = socket.create_connection(("127.0.0.1", 11985), timeout=5)
@@ -730,7 +731,7 @@ def test_stillborn_discard_and_cache():
         assert srv.stats["stillborn"] == 2, srv.stats
     finally:
         rdetour.STILLBORN_S = old
-    print("stillborn discard+cache OK (1 tunnel, 2 local refuses)")
+    print("stillborn cache OK — tunnel survives (1 tunnel, 2 local refuses)")
 
 
 

