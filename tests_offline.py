@@ -1372,7 +1372,8 @@ class ScoutTestStub(StubTunnel):
 
 
 def test_scout_probes_unknown():
-    """Unknown non-445 host:port goes through the scout tunnel, not warm."""
+    """Unknown 445 host goes through the scout tunnel (not warm) when
+    gw_fallback is off.  Non-445 goes straight to warm (see separate test)."""
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11986",
                                "--no-gw-fallback"])
@@ -1390,31 +1391,33 @@ def test_scout_probes_unknown():
     srv = rdetour.WarmSocksServer(args, warm_factory,
                                   scout_factory=scout_factory)
     c = _warm_session(srv, 11986)
+    smb2_neg = (b"\x00\x00\x00\x2f\xfeSMB"
+                + b"\x00" * 39)
     c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.20.20.20") +
-              struct.pack(">H", 22))
+              struct.pack(">H", 445))
     r = c.recv(10)
     assert r[1] == 0x00, r.hex()
-    c.sendall(b"SSH-2.0-test\r\n")
+    c.sendall(smb2_neg)
     echoed = b""
-    while len(echoed) < 14:
-        d = c.recv(64)
+    while len(echoed) < len(smb2_neg):
+        d = c.recv(256)
         if not d:
             break
         echoed += d
-    assert echoed == b"SSH-2.0-test\r\n"
+    assert echoed == smb2_neg
     c.close()
     time.sleep(2.0)
 
     assert scout_made == [1], "unknown must use scout: %r" % scout_made
     assert warm_made == [], "warm must not be touched: %r" % warm_made
     assert srv.stats["scout_probes"] == 1, srv.stats
-    assert "10.20.20.20:22" in srv.known_good, srv.known_good
+    assert "10.20.20.20:445" in srv.known_good, srv.known_good
     assert srv.stats["promoted"] == 1, srv.stats
-    print("scout probes unknown OK (scout used, warm untouched, promoted)")
+    print("scout probes unknown OK (445 scout used, warm untouched, promoted)")
 
 
 def test_scout_death_caches_kill():
-    """Scout dies probing a dead port → host:port cached as killer. Next
+    """Scout dies probing a dead 445 target → host:port cached as killer. Next
     connection refused locally, warm tunnel never touched."""
     import json
 
@@ -1441,12 +1444,14 @@ def test_scout_death_caches_kill():
 
     srv = rdetour.WarmSocksServer(args, warm_factory,
                                   scout_factory=scout_factory)
+    smb2_neg = (b"\x00\x00\x00\x2f\xfeSMB"
+                + b"\x00" * 39)
     c = _warm_session(srv, 11986)
     c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.30.30.30") +
-              struct.pack(">H", 22))
+              struct.pack(">H", 445))
     r = c.recv(10)
     assert r[1] == 0x00, r.hex()
-    c.sendall(b"SSH-2.0-test\r\n")
+    c.sendall(smb2_neg)
     try:
         after = c.recv(64)
     except ConnectionError:
@@ -1457,25 +1462,25 @@ def test_scout_death_caches_kill():
 
     assert scout_made == [1], scout_made
     assert warm_made == [], "warm must not be touched: %r" % warm_made
-    assert "10.30.30.30:22" in srv.kill_cache, srv.kill_cache
+    assert "10.30.30.30:445" in srv.kill_cache, srv.kill_cache
     assert srv.stats["scout_deaths"] == 1, srv.stats
     assert srv.stats["instakill_cached"] == 1, srv.stats
     with open(rdetour.kill_cache_path("gw")) as f:
-        assert "10.30.30.30:22" in json.load(f)["kills"]
+        assert "10.30.30.30:445" in json.load(f)["kills"]
 
     # second connection: refused locally, no tunnel
     c = _warm_session(srv, 11986)
     c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.30.30.30") +
-              struct.pack(">H", 22))
+              struct.pack(">H", 445))
     r = c.recv(10)
     assert r[1] == 0x05, r.hex()
     c.close()
     assert scout_made == [1], "cache hit must not rebuild scout: %r" % scout_made
-    print("scout death caches kill OK (non-445 cached, refused locally)")
+    print("scout death caches kill OK (445 cached, refused locally)")
 
 
 def test_known_good_routes_to_warm():
-    """After scout promotion, same host:port routes to the warm tunnel."""
+    """After scout promotion (445), same host:port routes to warm tunnel."""
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11986",
                                "--no-gw-fallback"])
@@ -1492,38 +1497,97 @@ def test_known_good_routes_to_warm():
 
     srv = rdetour.WarmSocksServer(args, warm_factory,
                                   scout_factory=scout_factory)
+    smb2_neg = (b"\x00\x00\x00\x2f\xfeSMB"
+                + b"\x00" * 39)
 
-    # connection 1: unknown → scout
+    # connection 1: unknown 445 → scout
     c = _warm_session(srv, 11986)
     c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.40.40.40") +
-              struct.pack(">H", 88))
+              struct.pack(">H", 445))
     r = c.recv(10)
     assert r[1] == 0x00, r.hex()
-    c.sendall(b"krb5")
+    c.sendall(smb2_neg)
     echoed = b""
-    while len(echoed) < 4:
-        echoed += c.recv(64)
+    while len(echoed) < len(smb2_neg):
+        d = c.recv(256)
+        if not d:
+            break
+        echoed += d
     c.close()
     time.sleep(2.0)
     assert scout_made == [1], scout_made
     assert warm_made == [], warm_made
-    assert "10.40.40.40:88" in srv.known_good
+    assert "10.40.40.40:445" in srv.known_good
 
     # connection 2: known-good → warm
     c = _warm_session(srv, 11986)
     c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.40.40.40") +
-              struct.pack(">H", 88))
+              struct.pack(">H", 445))
     r = c.recv(10)
     assert r[1] == 0x00, r.hex()
-    c.sendall(b"krb5")
+    c.sendall(smb2_neg)
     echoed = b""
-    while len(echoed) < 4:
-        echoed += c.recv(64)
+    while len(echoed) < len(smb2_neg):
+        d = c.recv(256)
+        if not d:
+            break
+        echoed += d
     c.close()
     time.sleep(2.0)
     assert warm_made == [1], "known-good must use warm: %r" % warm_made
     assert scout_made == [1], "scout must not be re-used: %r" % scout_made
     print("known-good routes to warm OK (scout→promote→warm)")
+
+
+def test_non445_unknown_uses_warm():
+    """Non-445 port on a completely unknown host goes straight to warm tunnel
+    (no scout) — the tunnel-killing risk is SMB-specific."""
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "0",
+                               "--no-gw-fallback"])
+    warm_made = []
+    scout_made = []
+
+    def warm_factory(host=None, port=None, auth_timeout=15):
+        warm_made.append(1)
+        return ScoutTestStub()
+
+    def scout_factory(host=None, port=None, auth_timeout=15):
+        scout_made.append(1)
+        return ScoutTestStub()
+
+    srv = rdetour.WarmSocksServer(args, warm_factory,
+                                  scout_factory=scout_factory)
+
+    l = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    l.bind(("127.0.0.1", 0))
+    l.listen(1)
+    ep = l.getsockname()[1]
+
+    def run():
+        conn, _ = l.accept()
+        l.close()
+        srv.handle(conn)
+
+    threading.Thread(target=run, daemon=True).start()
+    c = socket.create_connection(("127.0.0.1", ep), timeout=10)
+    c.sendall(b"\x05\x01\x00")
+    assert c.recv(2) == b"\x05\x00"
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.99.99.99") +
+              struct.pack(">H", 88))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"krb5")
+    echoed = b""
+    while len(echoed) < 4:
+        echoed += c.recv(64)
+    assert echoed == b"krb5"
+    c.close()
+    time.sleep(2.0)
+    assert warm_made == [1], "non-445 must use warm: %r" % warm_made
+    assert scout_made == [], "scout must not fire for non-445: %r" % scout_made
+    print("non-445 unknown uses warm OK (Kerberos on unknown host → warm)")
 
 
 def test_host_known_good_other_port_routes_warm():
@@ -1720,11 +1784,13 @@ def test_kill_cache_ttl():
 
 
 def test_scout_auto_rebuild():
-    """Scout dies, next unknown connection auto-rebuilds it."""
+    """Scout dies on first 445 probe, next unknown 445 auto-rebuilds it."""
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11986",
                                "--no-gw-fallback"])
     scout_made = []
+    smb2_neg = (b"\x00\x00\x00\x2f\xfeSMB"
+                + b"\x00" * 39)
 
     class RstOnceStub(ScoutTestStub):
         def write(self, d):
@@ -1744,13 +1810,13 @@ def test_scout_auto_rebuild():
     srv = rdetour.WarmSocksServer(args, scout_factory,
                                   scout_factory=scout_factory)
 
-    # connection 1: scout dies
+    # connection 1: scout dies on 445
     c = _warm_session(srv, 11986)
     c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.60.60.60") +
-              struct.pack(">H", 22))
+              struct.pack(">H", 445))
     r = c.recv(10)
     assert r[1] == 0x00, r.hex()
-    c.sendall(b"SSH-2.0-test\r\n")
+    c.sendall(smb2_neg)
     try:
         c.recv(64)
     except ConnectionError:
@@ -1760,20 +1826,23 @@ def test_scout_auto_rebuild():
     assert scout_made == [1], scout_made
     assert srv.scout is None or srv.scout.closed
 
-    # connection 2: auto-rebuild, different host:port
+    # connection 2: auto-rebuild, different unknown host on 445
     c = _warm_session(srv, 11986)
     c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.70.70.70") +
-              struct.pack(">H", 88))
+              struct.pack(">H", 445))
     r = c.recv(10)
     assert r[1] == 0x00, r.hex()
-    c.sendall(b"krb5")
+    c.sendall(smb2_neg)
     echoed = b""
-    while len(echoed) < 4:
-        echoed += c.recv(64)
+    while len(echoed) < len(smb2_neg):
+        d = c.recv(256)
+        if not d:
+            break
+        echoed += d
     c.close()
     time.sleep(2.0)
     assert scout_made == [1, 2], "auto-rebuild expected: %r" % scout_made
-    assert "10.70.70.70:88" in srv.known_good
+    assert "10.70.70.70:445" in srv.known_good
     print("scout auto-rebuild OK (dies, rebuilds, probes again)")
 
 
@@ -1917,6 +1986,7 @@ if __name__ == "__main__":
     test_scout_probes_unknown()
     test_scout_death_caches_kill()
     test_known_good_routes_to_warm()
+    test_non445_unknown_uses_warm()
     test_host_known_good_other_port_routes_warm()
     test_445_fallback_uses_warm_not_scout()
     test_kill_cache_generalized()

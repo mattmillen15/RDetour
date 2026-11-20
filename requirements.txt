@@ -1,2 +1,2 @@
-pyspnego>=0.9
-cryptography>=3.4
+pyspnego>=0.11.2
+cryptography>=43.0

