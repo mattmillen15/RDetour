@@ -57,7 +57,7 @@ With a real cert:
 Generate a cert (DNS record must point to your box):
 
 ```
-certbot certonly --standalone -d rds-corp.attacker.com
+sudo certbot certonly --standalone -d rds-corp.attacker.com
 cat /etc/letsencrypt/live/rds-corp.attacker.com/{fullchain,privkey}.pem > cert.pem
 ```
 
