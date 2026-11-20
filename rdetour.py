@@ -1385,6 +1385,7 @@ class WarmSocksServer(SocksServer):
                 gw_guid = self.gw_guid
                 wrote = [None]
                 life = [False]
+                auth_failed = [False]
                 t.drain_saw_data = False
 
                 def reader():
@@ -1399,6 +1400,11 @@ class WarmSocksServer(SocksServer):
                                 if classified:
                                     say("[conn %d] reader: relay %d bytes" %
                                         (conn_id, len(d)))
+                                    if len(d) > 16 and d[4:8] == b'\xfeSMB':
+                                        _rcmd = struct.unpack_from("<H", d, 16)[0]
+                                        _rst = struct.unpack_from("<I", d, 12)[0]
+                                        if _rcmd == 1 and _rst >= 0xC0000000:
+                                            auth_failed[0] = True
                                     client.sendall(d)
                                     continue
                                 snif += d
@@ -1478,6 +1484,11 @@ class WarmSocksServer(SocksServer):
                         if _smb2_cmd >= 2 and not host_known:
                             say("[conn %d] writer: drop %d bytes%s "
                                 "(first-contact gate)" %
+                                (conn_id, len(d), _cmd))
+                            break
+                        if _smb2_cmd >= 2 and auth_failed[0]:
+                            say("[conn %d] writer: drop %d bytes%s "
+                                "(auth failed)" %
                                 (conn_id, len(d), _cmd))
                             break
                         say("[conn %d] writer: fwd %d bytes%s" %
