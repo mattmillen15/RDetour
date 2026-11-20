@@ -12,11 +12,6 @@ import time
 sys.path.insert(0, "/home/kali/workspace/RDetour")
 import rdetour
 
-# kill-cache isolation at IMPORT time (pytest collects this module without
-# touching __main__): every WarmSocksServer reads AND writes the refused-445
-# cache, so point RDETOUR_CACHE_DIR at a throwaway dir — without it one run
-# poisons the operator's ~/.rdetour and the next run answers test hosts
-# from the cache (flake)
 _OLD_CACHE_DIR = os.environ.get("RDETOUR_CACHE_DIR")
 _CACHE_DIR = tempfile.mkdtemp(prefix="rdetour-tests-")
 os.environ["RDETOUR_CACHE_DIR"] = _CACHE_DIR
