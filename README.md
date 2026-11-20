@@ -42,19 +42,6 @@ Impacket v0.13.1 - Copyright Fortra, LLC and its affiliated companies
 [*] Saving ticket in testuser.ccache
 ```
 
-Password via environment variable:
-
-```
-export RDETOUR_PASSWORD='password'
-./rdetour.py -g rdg.corp.com -u user -d CORP
-```
-
-Pass-the-hash:
-
-```
-./rdetour.py -g rdg.corp.com -u user -d CORP --hashes aad3b435b51404eeaad3b435b51404ee:ntlmhash
-```
-
 ---
 
 ## RDRelay
