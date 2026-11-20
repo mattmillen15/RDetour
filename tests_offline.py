@@ -476,7 +476,7 @@ def test_warm_mode():
     call (one MFA push), channels opened/closed per connection."""
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11994",
-                               "--no-gw-fallback"])
+                               "--no-gw-fallback", "--no-scout"])
 
     class WarmStub(StubTunnel):
         def __init__(self, *a, **kw):
@@ -624,7 +624,8 @@ def test_smb1_probe_answered_locally():
     """A 445 client sending the SMB1 probe gets an RST and NO channel and
     NO tunnel: the probe must never touch the gateway."""
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
-                               "--socks-port", "11996", "--no-gw-fallback"])
+                               "--socks-port", "11996", "--no-gw-fallback",
+                               "--no-scout"])
     made = []
 
     class WarmStub(StubTunnel):
@@ -656,9 +657,10 @@ def test_smb1_probe_answered_locally():
     assert after == b"", after
     c.close()
     time.sleep(0.2)
-    assert made == [], "probe must not establish a tunnel: %r" % made
+    assert made == [1], "eager establish expected: %r" % made
     assert srv.stats["smb1_local"] == 1, srv.stats
-    print("smb1 probe local answer OK (no tunnel, no channel, client RST)")
+    assert srv.stats["opened"] == 0, "probe must not open a channel"
+    print("smb1 probe local answer OK (no channel, client RST)")
 
 
 def test_stillborn_discard_and_cache():
@@ -666,7 +668,8 @@ def test_stillborn_discard_and_cache():
     STILLBORN_S: client RST, tunnel discarded, and the host answered
     locally (SOCKS refused) on every later connection — no second tunnel."""
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
-                               "--socks-port", "11985", "--no-gw-fallback"])
+                               "--socks-port", "11985", "--no-gw-fallback",
+                               "--no-scout"])
     made = []
 
     class SilentStub(StubTunnel):
@@ -716,7 +719,7 @@ def test_stillborn_discard_and_cache():
 
         assert made == [1], made
         assert srv.stats["stillborn"] == 1, srv.stats
-        assert "10.7.7.7" in srv.stillborn_hosts
+        assert "10.7.7.7:445" in srv.kill_cache
         assert srv.tunnel is None or srv.tunnel.closed, "tunnel discarded"
 
         # second connection to the same host: refused locally, no tunnel
@@ -734,42 +737,6 @@ def test_stillborn_discard_and_cache():
         rdetour.STILLBORN_S = old
     print("stillborn discard+cache OK (1 tunnel, 2 local refuses)")
 
-
-def test_loopback_primary_refused_locally():
-    """A SOCKS CONNECT to a loopback primary (client-stack artifact, seen
-    live: nxc drain emitted one and the gateway's 23005 deny cost a tunnel)
-    must be refused locally: no channel, no tunnel, SOCKS reply 0x05."""
-    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
-                               "--socks-port", "11984", "--no-gw-fallback"])
-    made = []
-
-    class WarmStub(StubTunnel):
-        def open_channel(self, hosts, port, protocol=3):
-            self.channel_open = True
-            self._srv_closed_channel = False
-
-    def factory(host=None, port=None, auth_timeout=15):
-        made.append(1)
-        return WarmStub()
-
-    srv = rdetour.WarmSocksServer(args, factory)
-    threading.Thread(target=srv.serve, daemon=True).start()
-    time.sleep(0.3)
-
-    for host_bytes, why in ((socket.inet_aton("127.0.0.1"), "v4"),
-                            (b"\x00" * 15 + b"\x01", "v6")):
-        c = socket.create_connection(("127.0.0.1", 11984), timeout=5)
-        c.sendall(b"\x05\x01\x00")
-        assert c.recv(2) == b"\x05\x00"
-        c.sendall(b"\x05\x01\x00" + (b"\x01" if why == "v4" else b"\x04") +
-                  host_bytes + struct.pack(">H", 445))
-        r = c.recv(10)
-        assert r[1] == 0x05, (why, r.hex())   # connection refused, locally
-        c.close()
-    time.sleep(0.2)
-    assert made == [], "loopback primary must not establish a tunnel: %r" % made
-    assert srv.stats["loopback_local"] == 2, srv.stats
-    print("loopback primary local refuse OK (no tunnel, no channel, 2x 0x05)")
 
 
 def test_warm_flag_removed():
@@ -831,7 +798,7 @@ def test_refused445_cache_roundtrip():
     try:
         args = rdetour.parse_args(["-g", "rtgw", "-u", "jdoe", "-p", "x",
                                    "--socks-port", "11986",
-                                   "--no-gw-fallback"])
+                                   "--no-gw-fallback", "--no-scout"])
         made = []
 
         class SilentStub(StubTunnel):
@@ -875,13 +842,13 @@ def test_refused445_cache_roundtrip():
             time.sleep(0.3)
 
             assert made == [1], made
-            assert "10.8.8.8" in srv.stillborn_hosts, srv.stillborn_hosts
-            path = rdetour.refused445_cache_path("rtgw")
+            assert "10.8.8.8:445" in srv.kill_cache, srv.kill_cache
+            path = rdetour.kill_cache_path("rtgw")
             assert os.path.exists(path), path
             with open(path) as f:
                 doc = json.load(f)
-            assert doc["version"] == 1 and doc["gateway"] == "rtgw", doc
-            assert "10.8.8.8" in doc["refused445"], doc
+            assert doc["version"] == 2 and doc["gateway"] == "rtgw", doc
+            assert "10.8.8.8:445" in doc["kills"], doc
 
             # instance B: fresh server, same gateway — cache hit, no channel
             made2 = []
@@ -891,7 +858,7 @@ def test_refused445_cache_roundtrip():
                 return SilentStub()
 
             srv2 = rdetour.WarmSocksServer(args, factory2)
-            assert srv2.stillborn_hosts == {"10.8.8.8"}, srv2.stillborn_hosts
+            assert "10.8.8.8:445" in srv2.kill_cache, srv2.kill_cache
             c = _warm_session(srv2, 11986)
             c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.8.8.8") +
                       struct.pack(">H", 445))
@@ -922,7 +889,7 @@ def test_instakill_cached():
 
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11986",
-                               "--no-gw-fallback"])
+                               "--no-gw-fallback", "--no-scout"])
     made = []
     stubs = []
 
@@ -971,11 +938,11 @@ def test_instakill_cached():
     time.sleep(0.3)
 
     assert made == [1], made
-    assert "10.3.3.3" in srv.stillborn_hosts, srv.stillborn_hosts
+    assert "10.3.3.3:445" in srv.kill_cache, srv.kill_cache
     assert srv.stats["instakill_cached"] == 1, srv.stats
     assert not stubs[0].suspect, "silent RST on a clean tunnel is not dirty"
-    with open(rdetour.refused445_cache_path("gw")) as f:
-        assert "10.3.3.3" in json.load(f)["refused445"]
+    with open(rdetour.kill_cache_path("gw")) as f:
+        assert "10.3.3.3:445" in json.load(f)["kills"]
     print("insta-kill classification OK (no-reason silent RST cached)")
 
 
@@ -988,7 +955,7 @@ def test_delayed_kill_suppressed():
 
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11986",
-                               "--no-gw-fallback"])
+                               "--no-gw-fallback", "--no-scout"])
     stubs = []
 
     class DelayedKillStub(StubTunnel):
@@ -1064,10 +1031,10 @@ def test_delayed_kill_suppressed():
     time.sleep(0.3)
 
     assert len(stubs) == 1            # same tunnel object the whole time
-    assert "10.5.5.5" not in srv.stillborn_hosts, srv.stillborn_hosts
+    assert "10.5.5.5:445" not in srv.kill_cache, srv.kill_cache
     assert srv.stats["instakill_cached"] == 0, srv.stats
-    with open(rdetour.refused445_cache_path("gw")) as f:
-        assert "10.5.5.5" not in json.load(f)["refused445"]
+    with open(rdetour.kill_cache_path("gw")) as f:
+        assert "10.5.5.5:445" not in json.load(f)["kills"]
     print("delayed-kill suppression OK (dirty tunnel, no cache entry)")
 
 
@@ -1080,7 +1047,7 @@ def test_drain_seen_data_not_cached():
 
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11986",
-                               "--no-gw-fallback"])
+                               "--no-gw-fallback", "--no-scout"])
     live_guid = b"y" * 16
     stubs = []
 
@@ -1133,10 +1100,10 @@ def test_drain_seen_data_not_cached():
     assert len(stubs) == 1
     assert stubs[0].drain_saw_data, "drain must flag the consumed answer"
     assert stubs[0].suspect, "no-ack close must mark the tunnel"
-    assert "10.13.13.13" not in srv.stillborn_hosts, srv.stillborn_hosts
+    assert "10.13.13.13:445" not in srv.kill_cache, srv.kill_cache
     assert srv.stats["instakill_cached"] == 0, srv.stats
-    with open(rdetour.refused445_cache_path("gw")) as f:
-        assert "10.13.13.13" not in json.load(f)["refused445"]
+    with open(rdetour.kill_cache_path("gw")) as f:
+        assert "10.13.13.13:445" not in json.load(f)["kills"]
     print("drain-seen-data suppression OK (answer existed, not cached)")
 
 
@@ -1182,13 +1149,13 @@ def test_tunnel_data_seen_wiring():
 
 
 def test_live_then_abort_not_cached():
-    """A LIVE host that answers first and only then dies (the 0x800759d8
-    multi-request abort) must NOT enter the kill cache."""
+    """With the first-contact gate blocking TREE_CONNECT, 0x800759d8 hosts
+    are safe and must NOT be cached (they provide useful negotiate data)."""
     import json
 
     args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
                                "--socks-port", "11986",
-                               "--no-gw-fallback"])
+                               "--no-gw-fallback", "--no-scout"])
     made = []
     live_guid = b"z" * 16
 
@@ -1219,8 +1186,8 @@ def test_live_then_abort_not_cached():
             if self.answered:                        # answer relayed -> abort
                 self.last_srv_close_reason = 0x800759D8
                 self._srv_closed_channel = True
+                self._srv_close_ptype = 0x10
                 self.channel_open = False
-                self.closed = True
             return None
 
         def close_channel(self, timeout=8):
@@ -1253,12 +1220,12 @@ def test_live_then_abort_not_cached():
     time.sleep(0.3)
 
     assert made == [1], made
-    assert "10.12.12.12" not in srv.stillborn_hosts, srv.stillborn_hosts
+    assert "10.12.12.12:445" not in srv.kill_cache, srv.kill_cache
     assert srv.stats["instakill_cached"] == 0, srv.stats
-    with open(rdetour.refused445_cache_path("gw")) as f:
+    with open(rdetour.kill_cache_path("gw")) as f:
         doc = json.load(f)
-    assert "10.12.12.12" not in doc["refused445"], doc
-    print("live-then-abort NOT cached OK (answered host survives the filter)")
+    assert "10.12.12.12:445" not in doc["kills"], doc
+    print("live-then-abort NOT cached OK (first-contact gate protects)")
 
 
 def test_oracle_dead_cached():
@@ -1321,9 +1288,9 @@ def test_oracle_dead_cached():
 
     assert made == [1], made
     assert srv.stats["gw_dead"] == 1, srv.stats
-    assert "10.6.6.6" in srv.stillborn_hosts, srv.stillborn_hosts
-    with open(rdetour.refused445_cache_path("gw")) as f:
-        assert "10.6.6.6" in json.load(f)["refused445"]
+    assert "10.6.6.6:445" in srv.kill_cache, srv.kill_cache
+    with open(rdetour.kill_cache_path("gw")) as f:
+        assert "10.6.6.6:445" in json.load(f)["kills"]
     print("oracle-DEAD cached OK (gw-loopback verdict persists)")
 
 
@@ -1387,6 +1354,542 @@ def test_refused445_corrupt():
     print("refused-445 corrupt file OK (empty set, no exception)")
 
 
+class ScoutTestStub(StubTunnel):
+    """Full-featured echo stub for scout tests."""
+    def __init__(self, *a, **kw):
+        StubTunnel.__init__(self, *a, **kw)
+        self.channels = []
+        self.suspect = False
+        self._srv_closed_channel = False
+
+    def open_channel(self, hosts, port, protocol=3):
+        self.channels.append((hosts, port))
+        self.channel_open = True
+        self._srv_closed_channel = False
+        return self
+
+    def close_channel(self, timeout=8):
+        self.channel_open = False
+
+    def _close_channel_xchg(self, timeout=8):
+        self.channel_open = False
+
+
+def test_scout_probes_unknown():
+    """Unknown non-445 host:port goes through the scout tunnel, not warm."""
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "11986",
+                               "--no-gw-fallback"])
+    warm_made = []
+    scout_made = []
+
+    def warm_factory(host=None, port=None, auth_timeout=15):
+        warm_made.append(1)
+        return ScoutTestStub()
+
+    def scout_factory(host=None, port=None, auth_timeout=15):
+        scout_made.append(1)
+        return ScoutTestStub()
+
+    srv = rdetour.WarmSocksServer(args, warm_factory,
+                                  scout_factory=scout_factory)
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.20.20.20") +
+              struct.pack(">H", 22))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"SSH-2.0-test\r\n")
+    echoed = b""
+    while len(echoed) < 14:
+        d = c.recv(64)
+        if not d:
+            break
+        echoed += d
+    assert echoed == b"SSH-2.0-test\r\n"
+    c.close()
+    time.sleep(2.0)
+
+    assert scout_made == [1], "unknown must use scout: %r" % scout_made
+    assert warm_made == [], "warm must not be touched: %r" % warm_made
+    assert srv.stats["scout_probes"] == 1, srv.stats
+    assert "10.20.20.20:22" in srv.known_good, srv.known_good
+    assert srv.stats["promoted"] == 1, srv.stats
+    print("scout probes unknown OK (scout used, warm untouched, promoted)")
+
+
+def test_scout_death_caches_kill():
+    """Scout dies probing a dead port → host:port cached as killer. Next
+    connection refused locally, warm tunnel never touched."""
+    import json
+
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "11986",
+                               "--no-gw-fallback"])
+
+    class RstScoutStub(ScoutTestStub):
+        def write(self, d):
+            self._srv_closed_channel = False
+            self.channel_open = False
+            self.closed = True
+
+    warm_made = []
+    scout_made = []
+
+    def warm_factory(host=None, port=None, auth_timeout=15):
+        warm_made.append(1)
+        return ScoutTestStub()
+
+    def scout_factory(host=None, port=None, auth_timeout=15):
+        scout_made.append(1)
+        return RstScoutStub()
+
+    srv = rdetour.WarmSocksServer(args, warm_factory,
+                                  scout_factory=scout_factory)
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.30.30.30") +
+              struct.pack(">H", 22))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"SSH-2.0-test\r\n")
+    try:
+        after = c.recv(64)
+    except ConnectionError:
+        after = b""
+    assert after == b"", after
+    c.close()
+    time.sleep(2.0)
+
+    assert scout_made == [1], scout_made
+    assert warm_made == [], "warm must not be touched: %r" % warm_made
+    assert "10.30.30.30:22" in srv.kill_cache, srv.kill_cache
+    assert srv.stats["scout_deaths"] == 1, srv.stats
+    assert srv.stats["instakill_cached"] == 1, srv.stats
+    with open(rdetour.kill_cache_path("gw")) as f:
+        assert "10.30.30.30:22" in json.load(f)["kills"]
+
+    # second connection: refused locally, no tunnel
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.30.30.30") +
+              struct.pack(">H", 22))
+    r = c.recv(10)
+    assert r[1] == 0x05, r.hex()
+    c.close()
+    assert scout_made == [1], "cache hit must not rebuild scout: %r" % scout_made
+    print("scout death caches kill OK (non-445 cached, refused locally)")
+
+
+def test_known_good_routes_to_warm():
+    """After scout promotion, same host:port routes to the warm tunnel."""
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "11986",
+                               "--no-gw-fallback"])
+    warm_made = []
+    scout_made = []
+
+    def warm_factory(host=None, port=None, auth_timeout=15):
+        warm_made.append(1)
+        return ScoutTestStub()
+
+    def scout_factory(host=None, port=None, auth_timeout=15):
+        scout_made.append(1)
+        return ScoutTestStub()
+
+    srv = rdetour.WarmSocksServer(args, warm_factory,
+                                  scout_factory=scout_factory)
+
+    # connection 1: unknown → scout
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.40.40.40") +
+              struct.pack(">H", 88))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"krb5")
+    echoed = b""
+    while len(echoed) < 4:
+        echoed += c.recv(64)
+    c.close()
+    time.sleep(2.0)
+    assert scout_made == [1], scout_made
+    assert warm_made == [], warm_made
+    assert "10.40.40.40:88" in srv.known_good
+
+    # connection 2: known-good → warm
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.40.40.40") +
+              struct.pack(">H", 88))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"krb5")
+    echoed = b""
+    while len(echoed) < 4:
+        echoed += c.recv(64)
+    c.close()
+    time.sleep(2.0)
+    assert warm_made == [1], "known-good must use warm: %r" % warm_made
+    assert scout_made == [1], "scout must not be re-used: %r" % scout_made
+    print("known-good routes to warm OK (scout→promote→warm)")
+
+
+def test_host_known_good_other_port_routes_warm():
+    """If host:88 was promoted, host:135 should route to warm (host-level
+    knowledge: the host is live, no need to scout a different port)."""
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "0",
+                               "--no-gw-fallback"])
+    warm_made = []
+    scout_made = []
+
+    def warm_factory(host=None, port=None, auth_timeout=15):
+        warm_made.append(1)
+        return ScoutTestStub()
+
+    def scout_factory(host=None, port=None, auth_timeout=15):
+        scout_made.append(1)
+        return ScoutTestStub()
+
+    srv = rdetour.WarmSocksServer(args, warm_factory,
+                                  scout_factory=scout_factory)
+    srv.known_good.add("10.40.40.40:88")
+
+    l = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    l.bind(("127.0.0.1", 0))
+    l.listen(1)
+    ep = l.getsockname()[1]
+
+    def run():
+        conn, _ = l.accept()
+        l.close()
+        srv.handle(conn)
+
+    threading.Thread(target=run, daemon=True).start()
+    c = socket.create_connection(("127.0.0.1", ep), timeout=10)
+    c.sendall(b"\x05\x01\x00")
+    assert c.recv(2) == b"\x05\x00"
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.40.40.40") +
+              struct.pack(">H", 135))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"rpc")
+    echoed = b""
+    while len(echoed) < 3:
+        echoed += c.recv(64)
+    c.close()
+    time.sleep(2.0)
+    assert warm_made == [1], "host-known must route to warm: %r" % warm_made
+    assert scout_made == [], "scout must not fire: %r" % scout_made
+    print("host-level known-good routes other ports to warm OK")
+
+
+def test_445_fallback_uses_warm_not_scout():
+    """Port 445 with gw_fallback enabled always goes to warm (the loopback
+    fallback IS the scouting mechanism for 445)."""
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "11986"])
+    warm_made = []
+    scout_made = []
+    gw_guid = b"G" * 16
+
+    class FbStub(ScoutTestStub):
+        def __init__(self, *a, **kw):
+            ScoutTestStub.__init__(self, *a, **kw)
+            self.out_q = []
+        def open_channel(self, hosts, port, protocol=3):
+            first = hosts if isinstance(hosts, str) else hosts[0]
+            self.channels.append((hosts, port))
+            r = {("127.0.0.1", 445): _smb2_resp(gw_guid),
+                 ("10.50.50.50", 445): _smb2_resp(b"L" * 16)}
+            if (first, port) in r:
+                self.out_q.append(r[(first, port)])
+                self.event.set()
+            self.channel_open = True
+            self._srv_closed_channel = False
+            return self
+        def read(self, timeout=15):
+            if self.out_q:
+                return self.out_q.pop(0)
+            return StubTunnel.read(self, timeout)
+
+    def warm_factory(host=None, port=None, auth_timeout=15):
+        warm_made.append(1)
+        return FbStub()
+
+    def scout_factory(host=None, port=None, auth_timeout=15):
+        scout_made.append(1)
+        return FbStub()
+
+    srv = rdetour.WarmSocksServer(args, warm_factory,
+                                  scout_factory=scout_factory)
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.50.50.50") +
+              struct.pack(">H", 445))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(rdetour.smb2_negotiate())
+    got = b""
+    while len(got) < 92:
+        d = c.recv(128)
+        if not d:
+            break
+        got += d
+    c.close()
+    time.sleep(2.0)
+    assert warm_made == [1], "445+fallback must use warm: %r" % warm_made
+    assert scout_made == [], "scout must not be used for 445: %r" % scout_made
+    print("445 fallback uses warm OK (scout not touched)")
+
+
+def test_kill_cache_generalized():
+    """Non-445 entries in the kill cache refuse connections locally."""
+    import json
+    import shutil
+    import tempfile
+
+    old_cd = os.environ.get("RDETOUR_CACHE_DIR")
+    cdir = tempfile.mkdtemp(prefix="rdetour-gen-")
+    os.environ["RDETOUR_CACHE_DIR"] = cdir
+    try:
+        gw = "gen-gw"
+        rdetour.save_kill_cache(gw, {"10.1.1.1:22": time.time(),
+                                     "10.2.2.2:3389": time.time()})
+        loaded = rdetour.load_kill_cache(gw)
+        assert "10.1.1.1:22" in loaded, loaded
+        assert "10.2.2.2:3389" in loaded, loaded
+    finally:
+        if old_cd is None:
+            del os.environ["RDETOUR_CACHE_DIR"]
+        else:
+            os.environ["RDETOUR_CACHE_DIR"] = old_cd
+        shutil.rmtree(cdir, ignore_errors=True)
+    print("kill cache generalized OK (non-445 entries load correctly)")
+
+
+def test_kill_cache_legacy_migration():
+    """v1 refused-445 entries migrate into v2 kill cache as host:445."""
+    import json
+    import shutil
+    import tempfile
+
+    old_cd = os.environ.get("RDETOUR_CACHE_DIR")
+    cdir = tempfile.mkdtemp(prefix="rdetour-mig-")
+    os.environ["RDETOUR_CACHE_DIR"] = cdir
+    try:
+        gw = "mig-gw"
+        rdetour.save_refused445(gw, {"10.9.9.9": time.time()})
+        loaded = rdetour.load_kill_cache(gw)
+        assert "10.9.9.9:445" in loaded, loaded
+        path = rdetour.kill_cache_path(gw)
+        assert os.path.exists(path), "v2 file should be written on migration"
+        with open(path) as f:
+            doc = json.load(f)
+        assert "10.9.9.9:445" in doc["kills"], doc
+    finally:
+        if old_cd is None:
+            del os.environ["RDETOUR_CACHE_DIR"]
+        else:
+            os.environ["RDETOUR_CACHE_DIR"] = old_cd
+        shutil.rmtree(cdir, ignore_errors=True)
+    print("kill cache legacy migration OK (v1 host → v2 host:445)")
+
+
+def test_kill_cache_ttl():
+    """Kill cache TTL: expired entries dropped, fresh ones kept."""
+    import json
+    import shutil
+    import tempfile
+
+    old_cd = os.environ.get("RDETOUR_CACHE_DIR")
+    cdir = tempfile.mkdtemp(prefix="rdetour-kttl-")
+    os.environ["RDETOUR_CACHE_DIR"] = cdir
+    try:
+        gw = "kttl-gw"
+        rdetour.save_kill_cache(gw, {
+            "10.1.1.1:22": time.time() - rdetour.REFUSED_CACHE_TTL_S - 3600,
+            "10.2.2.2:88": time.time(),
+        })
+        loaded = rdetour.load_kill_cache(gw)
+        assert "10.1.1.1:22" not in loaded, loaded
+        assert "10.2.2.2:88" in loaded, loaded
+        with open(rdetour.kill_cache_path(gw)) as f:
+            doc = json.load(f)
+        assert "10.1.1.1:22" not in doc["kills"]
+        assert "10.2.2.2:88" in doc["kills"]
+    finally:
+        if old_cd is None:
+            del os.environ["RDETOUR_CACHE_DIR"]
+        else:
+            os.environ["RDETOUR_CACHE_DIR"] = old_cd
+        shutil.rmtree(cdir, ignore_errors=True)
+    print("kill cache TTL OK (expired dropped, fresh kept)")
+
+
+def test_scout_auto_rebuild():
+    """Scout dies, next unknown connection auto-rebuilds it."""
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "11986",
+                               "--no-gw-fallback"])
+    scout_made = []
+
+    class RstOnceStub(ScoutTestStub):
+        def write(self, d):
+            self._srv_closed_channel = False
+            self.channel_open = False
+            self.closed = True
+
+    call_count = [0]
+
+    def scout_factory(host=None, port=None, auth_timeout=15):
+        call_count[0] += 1
+        scout_made.append(call_count[0])
+        if call_count[0] == 1:
+            return RstOnceStub()
+        return ScoutTestStub()
+
+    srv = rdetour.WarmSocksServer(args, scout_factory,
+                                  scout_factory=scout_factory)
+
+    # connection 1: scout dies
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.60.60.60") +
+              struct.pack(">H", 22))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"SSH-2.0-test\r\n")
+    try:
+        c.recv(64)
+    except ConnectionError:
+        pass
+    c.close()
+    time.sleep(2.0)
+    assert scout_made == [1], scout_made
+    assert srv.scout is None or srv.scout.closed
+
+    # connection 2: auto-rebuild, different host:port
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.70.70.70") +
+              struct.pack(">H", 88))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"krb5")
+    echoed = b""
+    while len(echoed) < 4:
+        echoed += c.recv(64)
+    c.close()
+    time.sleep(2.0)
+    assert scout_made == [1, 2], "auto-rebuild expected: %r" % scout_made
+    assert "10.70.70.70:88" in srv.known_good
+    print("scout auto-rebuild OK (dies, rebuilds, probes again)")
+
+
+def test_session_jar_cookie_flow():
+    """Session jar: cookies from tunnel A are seeded into tunnel B, and
+    connection/correlation IDs are reused across tunnel instances."""
+    jar = {}
+    # Tunnel A: establish, inject cookies as the gateway would
+    t1 = rdetour.RDGTunnel("gw", session_jar=jar)
+    assert t1._cookies == [], "first tunnel starts with no cookies"
+    # Simulate gateway setting cookies during leg establishment
+    t1._cookies = ["session=abc123", "duo_approved=yes"]
+    # Simulate successful establish saving to jar
+    jar["cookies"] = list(t1._cookies)
+    jar["conn_id"] = t1.conn_id
+    jar["corr_id"] = t1.corr_id
+    saved_conn = t1.conn_id
+    saved_corr = t1.corr_id
+
+    # Tunnel B: new instance with same jar should inherit cookies + IDs
+    t2 = rdetour.RDGTunnel("gw", session_jar=jar)
+    assert t2._cookies == ["session=abc123", "duo_approved=yes"], t2._cookies
+    assert t2.conn_id == saved_conn, t2.conn_id
+    assert t2.corr_id == saved_corr, t2.corr_id
+
+    # Without jar: fresh UUIDs, no cookies
+    t3 = rdetour.RDGTunnel("gw")
+    assert t3._cookies == [], t3._cookies
+    assert t3.conn_id != saved_conn, "must generate fresh conn_id"
+
+    # With jar=None: same as no jar
+    t4 = rdetour.RDGTunnel("gw", session_jar=None)
+    assert t4._cookies == [], t4._cookies
+
+    # Empty jar: fresh IDs, no cookies yet
+    t5 = rdetour.RDGTunnel("gw", session_jar={})
+    assert t5._cookies == [], t5._cookies
+    assert t5.conn_id != saved_conn
+    print("session jar cookie flow OK (cookies + IDs propagate across tunnels)")
+
+
+def test_session_jar_in_factory():
+    """Session jar wired through the warm-mode factory: second tunnel gets
+    first tunnel's cookies."""
+    jar = {}
+    made = []
+
+    class JarStub(ScoutTestStub):
+        def __init__(self, *a, session_jar=None, **kw):
+            ScoutTestStub.__init__(self, *a, **kw)
+            self.session_jar = session_jar
+            self._cookies = []
+            if session_jar and session_jar.get("cookies"):
+                self._cookies = list(session_jar["cookies"])
+
+    def factory(host=None, port=None, auth_timeout=15):
+        t = JarStub(session_jar=jar)
+        made.append(t)
+        # Simulate gateway setting cookies on first establish
+        if not t._cookies:
+            t._cookies = ["gw_session=first"]
+        # Simulate establish() saving to jar
+        jar["cookies"] = list(t._cookies)
+        return t
+
+    args = rdetour.parse_args(["-g", "gw", "-u", "jdoe", "-p", "x",
+                               "--socks-port", "11986",
+                               "--no-gw-fallback", "--no-scout"])
+    srv = rdetour.WarmSocksServer(args, factory)
+    # First connection: creates tunnel A
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.1.1.1") +
+              struct.pack(">H", 80))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"GET / HTTP/1.0\r\n\r\n")
+    echoed = b""
+    while len(echoed) < 18:
+        d = c.recv(128)
+        if not d:
+            break
+        echoed += d
+    c.close()
+    time.sleep(0.5)
+    assert len(made) == 1
+    assert made[0]._cookies == ["gw_session=first"]
+
+    # Kill the tunnel to force rebuild
+    srv.tunnel.closed = True
+    srv.tunnel = None
+
+    # Second connection: rebuilds tunnel B — should inherit cookies
+    c = _warm_session(srv, 11986)
+    c.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("10.2.2.2") +
+              struct.pack(">H", 80))
+    r = c.recv(10)
+    assert r[1] == 0x00, r.hex()
+    c.sendall(b"GET / HTTP/1.0\r\n\r\n")
+    echoed = b""
+    while len(echoed) < 18:
+        d = c.recv(128)
+        if not d:
+            break
+        echoed += d
+    c.close()
+    time.sleep(0.5)
+    assert len(made) == 2
+    assert made[1]._cookies == ["gw_session=first"], \
+        "second tunnel must inherit cookies: %r" % made[1]._cookies
+    print("session jar in factory OK (cookies propagate across rebuilds)")
+
+
 if __name__ == "__main__":
     test_identity_forms()
     test_probe_bytes()
@@ -1405,7 +1908,6 @@ if __name__ == "__main__":
     test_smb1_probe_matcher()
     test_smb1_probe_answered_locally()
     test_stillborn_discard_and_cache()
-    test_loopback_primary_refused_locally()
     test_warm_flag_removed()
     test_refused445_cache_roundtrip()
     test_instakill_cached()
@@ -1416,4 +1918,15 @@ if __name__ == "__main__":
     test_oracle_dead_cached()
     test_refused445_ttl()
     test_refused445_corrupt()
+    test_scout_probes_unknown()
+    test_scout_death_caches_kill()
+    test_known_good_routes_to_warm()
+    test_host_known_good_other_port_routes_warm()
+    test_445_fallback_uses_warm_not_scout()
+    test_kill_cache_generalized()
+    test_kill_cache_legacy_migration()
+    test_kill_cache_ttl()
+    test_scout_auto_rebuild()
+    test_session_jar_cookie_flow()
+    test_session_jar_in_factory()
     print("ALL OFFLINE TESTS PASSED")

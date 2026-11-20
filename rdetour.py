@@ -349,7 +349,7 @@ class RDGTunnel:
     def __init__(self, gateway, gport=443, domain=None, user=None, password=None,
                  nthash=None, path="/remoteDesktopGateway/", client_name=None,
                  connect_timeout=15, verbose=False, ext_auth="none",
-                 paa_cookie=None):
+                 paa_cookie=None, session_jar=None):
         self.gateway = gateway
         self.gport = gport
         self.path = path
@@ -359,11 +359,19 @@ class RDGTunnel:
                          "paa": self.EXT_AUTH_PAA,
                          "sspi_ntlm": self.EXT_AUTH_SSPI_NTLM}[ext_auth]
         self.paa_cookie = paa_cookie
-        self.conn_id = str(uuid.uuid4()).upper()
-        self.corr_id = str(uuid.uuid4()).upper()
+        self._session_jar = session_jar
+        if session_jar is not None and session_jar.get("conn_id"):
+            self.conn_id = session_jar["conn_id"]
+            self.corr_id = session_jar["corr_id"]
+        else:
+            self.conn_id = str(uuid.uuid4()).upper()
+            self.corr_id = str(uuid.uuid4()).upper()
         self.client_name = (client_name or socket.gethostname())[:15]
         self._cbt = {}
-        self._cookies = []
+        if session_jar is not None and session_jar.get("cookies"):
+            self._cookies = list(session_jar["cookies"])
+        else:
+            self._cookies = []
         self.out_tls = self.in_tls = None
         self.out_reader = None
         self.closed = False          # tunnel dead (TLS/RST/explicit close)
@@ -381,6 +389,7 @@ class RDGTunnel:
                                      # target DID answer
         self.channel_open = False    # a channel is live on this tunnel
         self._srv_closed_channel = False  # gateway closed the channel itself
+        self._srv_close_ptype = None     # 0x10 (server-init) or 0x11 (our ack)
         self._ka_stop = threading.Event()
         try:
             import spnego
@@ -488,6 +497,9 @@ class RDGTunnel:
         """Legs + handshake + tunnel create/auth. This is the stage a
         per-auth MFA plugin (Duo RDG) pushes at — one establish = one push.
         No channel yet: the tunnel can sit warm until open_channel()."""
+        if self._cookies:
+            self.log("session reuse: seeding %d cookies + conn %s"
+                     % (len(self._cookies), self.conn_id[:8]))
         self.out_tls, out_resp = self._establish_leg("RDG_OUT_DATA")
         if (out_resp.header("transfer-encoding", "") or "").lower() == "chunked":
             self.out_tls.buf = out_resp.rest
@@ -506,6 +518,10 @@ class RDGTunnel:
             self._extauth_sspi_exchange()
         self._tunnel_create()
         self._tunnel_auth(auth_timeout)
+        if self._session_jar is not None:
+            self._session_jar["cookies"] = list(self._cookies)
+            self._session_jar["conn_id"] = self.conn_id
+            self._session_jar["corr_id"] = self.corr_id
         threading.Thread(target=self._keepalive_loop, daemon=True).start()
         return self
 
@@ -528,6 +544,7 @@ class RDGTunnel:
         self._channel_create(hosts, port, protocol)
         self.channel_open = True
         self._srv_closed_channel = False
+        self._srv_close_ptype = None
         self.last_srv_close_reason = None
         return self
 
@@ -795,12 +812,13 @@ class RDGTunnel:
             if ptype in (0x10, 0x11):  # close channel (either direction)
                 self.channel_open = False
                 self._srv_closed_channel = True
+                self._srv_close_ptype = ptype
                 if len(body) >= 4:
                     self.last_srv_close_reason = struct.unpack(
                         "<I", body[0:4])[0]
                     if self.last_srv_close_reason == 0x800759D8:
-                        self.log("gateway aborted channel: 0x800759d8 "
-                                 "(channel IO failure — target closed/reset)")
+                        self.closed = True
+                        self.log("0x800759d8 — tunnel dead")
                 return None
             self.log("packet 0x%x ignored" % ptype)
         return None
@@ -1186,6 +1204,76 @@ def save_refused445(gateway, entries):
         raise
 
 
+# ---- generalized kill cache (any host:port) ----
+
+def kill_cache_path(gateway):
+    name = re.sub(r"[^a-z0-9.-]+", "-", gateway.lower())
+    d = os.environ.get("RDETOUR_CACHE_DIR", os.path.expanduser("~/.rdetour"))
+    return os.path.join(d, "killcache-%s-%s.json" %
+                        (name, hashlib.sha1(
+                            gateway.encode("utf-8")).hexdigest()[:8]))
+
+
+def load_kill_cache(gateway):
+    """host:port pairs classified as tunnel-killers for this gateway.
+    Loads the v2 killcache file; also migrates legacy v1 refused-445
+    entries as host:445.  TTL-expired entries are dropped on load."""
+    entries = {}
+    path = kill_cache_path(gateway)
+    try:
+        with open(path, "r") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and isinstance(doc.get("kills"), dict):
+            entries = doc["kills"]
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        say("[warm] kill cache unreadable (%s) — starting empty" % e)
+    # migrate legacy v1 refused-445 entries
+    try:
+        with open(refused445_cache_path(gateway), "r") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and isinstance(doc.get("refused445"), dict):
+            for h, ts in doc["refused445"].items():
+                key = "%s:445" % h
+                if key not in entries and isinstance(ts, (int, float)):
+                    entries[key] = ts
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    now = time.time()
+    live = {}
+    for key, ts in entries.items():
+        if isinstance(ts, (int, float)) and now - ts < REFUSED_CACHE_TTL_S:
+            live[key] = min(ts, now)
+    v2_existed = os.path.exists(path)
+    if len(live) != len(entries) or (live and not v2_existed):
+        try:
+            save_kill_cache(gateway, live)
+        except OSError as e:
+            say("[warm] kill cache rewrite failed (%s)" % e)
+    return set(live)
+
+
+def save_kill_cache(gateway, entries):
+    """Atomic write. entries is {"host:port": classified-at-ts}."""
+    path = kill_cache_path(gateway)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                               prefix=os.path.basename(path) + ".",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump({"version": 2, "gateway": gateway,
+                       "kills": entries}, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class WarmSocksServer(SocksServer):
     """SOCKS5 over ONE MFA-paid tunnel, reused via the wire-verified channel
     cycle CLOSE_CHANNEL(0) -> CHANNEL_CREATE. Every proxied connection is a
@@ -1224,25 +1312,33 @@ class WarmSocksServer(SocksServer):
     - TUNNEL_CLOSE / idle keepalive failure also end the tunnel
     """
 
-    def __init__(self, args, tunnel_factory):
+    def __init__(self, args, tunnel_factory, scout_factory=None):
         SocksServer.__init__(self, args, tunnel_factory)
         self.tunnel = None
         self.chan_lock = threading.Lock()   # one channel at a time
         self.tunnel_lock = threading.Lock()
+        # scout tunnel for probing unknown host:port pairs — expendable,
+        # auto-rebuilds on death so the warm tunnel never sees unknowns
+        self.scout = None
+        self.scout_factory = scout_factory or tunnel_factory
+        self.scout_lock = threading.Lock()       # one scout probe at a time
+        self.scout_tunnel_lock = threading.Lock()
+        self.known_good = set()                  # "host:port" — session-scoped
         # gateway-loopback fallback oracle (port 445)
-        self.gw_guid = None                 # gateway's SMB ServerGUID
+        self.gw_guid = None
         self.gw_guid_tried = False
-        self.gw_ips = set()                 # gateway's own addresses
+        self.gw_ips = set()
         self.stats["gw_dead"] = 0
-        self.stats["smb1_local"] = 0        # probes answered locally (free)
-        self.stats["loopback_local"] = 0    # loopback primaries refused free
-        self.stats["stillborn"] = 0         # granted-but-silent channels
-        self.stats["instakill_cached"] = 0  # first-contact RST aborts cached
+        self.stats["smb1_local"] = 0
+        self.stats["stillborn"] = 0
+        self.stats["instakill_cached"] = 0
+        self.stats["scout_probes"] = 0
+        self.stats["scout_deaths"] = 0
+        self.stats["promoted"] = 0
         self.refused_lock = threading.Lock()
-        self.stillborn_hosts = load_refused445(self.args.gateway)
-        say("[warm] refused-445 cache: %d hosts loaded from %s" %
-            (len(self.stillborn_hosts),
-             refused445_cache_path(self.args.gateway)))
+        self.kill_cache = load_kill_cache(self.args.gateway)
+        say("[warm] kill cache: %d entries loaded from %s" %
+            (len(self.kill_cache), kill_cache_path(self.args.gateway)))
 
     def _abort(self, client, replied, code, msg):
         """Fail a SOCKS client. After a success reply (the 445 sniff path)
@@ -1256,6 +1352,7 @@ class WarmSocksServer(SocksServer):
     def _gateway_ips(self):
         if not self.gw_ips:
             self.gw_ips.add(str(self.args.gateway).lower())
+            self.gw_ips.update(("127.0.0.1", "localhost", "::1"))
             try:
                 self.gw_ips.update(
                     ai[4][0] for ai in socket.getaddrinfo(
@@ -1325,43 +1422,54 @@ class WarmSocksServer(SocksServer):
             say("[warm] tunnel live — channels from here on are free")
             return t
 
-    def _refused_remember(self, host, why):
-        """Classify host refused-on-445 and persist it: later connections —
-        this run or any run inside the TTL — are answered locally, so the
-        host can never again cost a tunnel (and a push). Returns True only
-        when the host was newly added (stat callers dedup on it)."""
-        # same normalization as the loopback primary check, so the cached
-        # key matches the lookup however the client typed the host
-        host = str(host).strip().lower()
+    def _ensure_scout(self):
+        with self.scout_tunnel_lock:
+            s = self.scout
+            if s is not None and not s.closed:
+                return s
+            if s is not None:
+                s.close()
+            say("[scout] establishing scout tunnel (window %ds)"
+                % self.args.auth_timeout)
+            s = self.scout_factory(auth_timeout=self.args.auth_timeout)
+            s.suspect = False
+            self.scout = s
+            self.stats["pushes"] += 1
+            say("[scout] scout tunnel live — probing unknowns")
+            return s
+
+    def _kill_remember(self, host, port, why):
+        """Classify host:port as a tunnel-killer and persist it: later
+        connections — this run or any inside the TTL — are refused locally.
+        Returns True only when the entry was newly added."""
+        key = "%s:%d" % (str(host).strip().lower(), port)
         with self.refused_lock:
-            if host in self.stillborn_hosts:
+            if key in self.kill_cache:
                 return False
-            self.stillborn_hosts.add(host)
-            # merge onto the FILE's entries (not just the in-memory set) so
-            # unrelated hosts keep their original classify timestamps
+            self.kill_cache.add(key)
             entries = {}
             try:
-                with open(refused445_cache_path(self.args.gateway),
-                          "r") as f:
+                with open(kill_cache_path(self.args.gateway), "r") as f:
                     doc = json.load(f)
                 if isinstance(doc, dict) and \
-                        isinstance(doc.get("refused445"), dict):
-                    entries = doc["refused445"]
+                        isinstance(doc.get("kills"), dict):
+                    entries = doc["kills"]
             except (OSError, ValueError):
                 pass
-            entries[str(host)] = time.time()
+            entries[key] = time.time()
             try:
-                save_refused445(self.args.gateway, entries)
+                save_kill_cache(self.args.gateway, entries)
             except OSError as e:
-                say("[warm] refused-445 cache write failed (%s)" % e)
-            say("[warm] %s cached refused-445 (%s) — future connections "
-                "answered locally" % (host, why))
+                say("[warm] kill cache write failed (%s)" % e)
+            say("[warm] %s cached kill (%s) — future connections "
+                "answered locally" % (key, why))
             return True
 
     def handle(self, client):
         t = None
         conn_id = self._next_conn()
         replied = False
+        is_scout = False
         try:
             target = self._negotiate(client)
             if target is None:
@@ -1369,23 +1477,10 @@ class WarmSocksServer(SocksServer):
             host, port = target
             self.args.log("CONNECT %s:%d" % (host, port))
             h = str(host).strip().lower()
-            if h == "localhost" or h == "::1" or h.startswith("127."):
-                # loopback as the client-requested PRIMARY target: the
-                # gateway denies the create (23005, observed live — a
-                # client-stack artifact cost a whole tunnel). Loopback as
-                # the fallback's ALTERNATE is fine; as primary it never
-                # is. Refuse locally, tunnel untouched.
-                self.stats["loopback_local"] += 1
-                self.fail(client, 0x05, "loopback refused locally")
-                say("[conn %d] %s:%d loopback refused — answered locally, "
-                    "tunnel untouched" % (conn_id, host, port))
-                return
-            if port == 445 and h in self.stillborn_hosts:
-                # diagnosed refused port from an earlier connection: probing
-                # again would wedge another tunnel (and cost another push);
-                # answering locally costs nothing
+            key = "%s:%d" % (h, port)
+            if key in self.kill_cache:
                 self.stats["stillborn"] += 1
-                self.fail(client, 0x05, "refused (cached stillborn)")
+                self.fail(client, 0x05, "refused (cached)")
                 say("[conn %d] %s:%d refused (cached) — answered locally, "
                     "tunnel untouched" % (conn_id, host, port))
                 return
@@ -1414,11 +1509,35 @@ class WarmSocksServer(SocksServer):
                     rst(client)
                     return
                 client.settimeout(None)
-            with self.chan_lock:            # serialized: one channel at a time
-                t = self._ensure_tunnel()
-                host_is_gw = str(host).lower() in self._gateway_ips()
-                use_fb = (port == 445 and not host_is_gw
-                          and self._ensure_gw_guid(t) is not None)
+            # Routing: 445-with-fallback → warm (loopback IS the scout),
+            # known-good → warm, unknown → scout tunnel.
+            # Check the HOST broadly: if any port on this host has been
+            # promoted, the host is live — don't waste a scout probe.
+            no_scout = getattr(self.args, 'no_scout', False)
+            host_known = any(k.startswith(h + ":") for k in self.known_good)
+            is_scout = (not no_scout and not host_known
+                        and key not in self.known_good
+                        and not (port == 445
+                                 and getattr(self.args, 'gw_fallback', True)))
+            if is_scout:
+                wt = self.tunnel
+                if wt is not None and not wt.closed:
+                    self.stats["failed"] += 1
+                    self._abort(client, replied, 0x05,
+                                "scout blocked — warm tunnel alive")
+                    return
+            lock = self.scout_lock if is_scout else self.chan_lock
+            with lock:
+                if is_scout:
+                    t = self._ensure_scout()
+                    self.stats["scout_probes"] += 1
+                else:
+                    t = self._ensure_tunnel()
+                use_fb = False
+                if not is_scout:
+                    host_is_gw = str(host).lower() in self._gateway_ips()
+                    use_fb = (port == 445 and not host_is_gw
+                              and self._ensure_gw_guid(t) is not None)
                 if t.channel_open:
                     # previous session's close never completed — best effort
                     try:
@@ -1428,24 +1547,41 @@ class WarmSocksServer(SocksServer):
                 try:
                     t.open_channel([host, "127.0.0.1"] if use_fb else host,
                                    port)
-                except (RDGPolicyError, RDGUnreachableError):
-                    # A denied channel create kills the tunnel (observed
-                    # RST) — and a silent one (no response in 25s) gets its
-                    # denial late, which RSTs the tunnel right after. Either
-                    # way the tunnel is spent: discard it.
-                    # (Cannot happen on 445 with the fallback armed.)
+                except (ConnectionError, ssl.SSLError, OSError):
+                    say("[conn %d] tunnel dead on channel open — "
+                        "rebuilding" % conn_id)
                     t.closed = True
                     try:
                         t.close()
                     except Exception:
                         pass
-                    self.tunnel = None
+                    if is_scout:
+                        self.scout = None
+                        t = self._ensure_scout()
+                    else:
+                        self.tunnel = None
+                        t = self._ensure_tunnel()
+                    if use_fb:
+                        self._ensure_gw_guid(t)
+                    t.open_channel(
+                        [host, "127.0.0.1"] if use_fb else host, port)
+                except (RDGPolicyError, RDGUnreachableError):
+                    t.closed = True
+                    try:
+                        t.close()
+                    except Exception:
+                        pass
+                    if is_scout:
+                        self.scout = None
+                    else:
+                        self.tunnel = None
                     raise
                 if not replied:
                     self.reply(client, 0x00)
                 self.stats["opened"] += 1
-                say("[conn %d] channel %s:%d on warm tunnel%s" %
-                    (conn_id, host, port,
+                tname = "scout" if is_scout else "warm tunnel"
+                say("[conn %d] channel %s:%d on %s%s" %
+                    (conn_id, host, port, tname,
                      " (+gw fallback)" if use_fb else ""))
 
                 gw_guid = self.gw_guid
@@ -1465,6 +1601,8 @@ class WarmSocksServer(SocksServer):
                             if d:                   # channel_open flips fast
                                 life[0] = True      # so it can never steal
                                 if classified:      # the NEXT channel's data
+                                    say("[conn %d] reader: relay %d bytes" %
+                                        (conn_id, len(d)))
                                     client.sendall(d)
                                     continue
                                 # Fallback channel: hold the first response
@@ -1488,9 +1626,8 @@ class WarmSocksServer(SocksServer):
                                     # hit (host .158 killed 1-of-3 observed
                                     # contacts) — cached, later contacts are
                                     # free AND immune to the race
-                                    self._refused_remember(
-                                        host, "gateway-loopback oracle")
-                                    t.channel_open = False
+                                    self._kill_remember(
+                                        host, port, "gateway-loopback oracle")
                                     try:
                                         client.shutdown(socket.SHUT_RDWR)
                                     except Exception:
@@ -1516,10 +1653,8 @@ class WarmSocksServer(SocksServer):
                                     t.close()
                                 except Exception:
                                     pass
-                                cached = ""
-                                if port == 445:
-                                    self._refused_remember(host, "stillborn")
-                                    cached = ", 445 cached local-refuse"
+                                self._kill_remember(host, port, "stillborn")
+                                cached = ", cached local-refuse"
                                 say("[conn %d] %s:%d STILLBORN — granted but"
                                     " silent %.1fs (refused port?): tunnel "
                                     "discarded%s" %
@@ -1536,8 +1671,9 @@ class WarmSocksServer(SocksServer):
                             # else: client hasn't written yet, or the target
                             # is quiet mid-session — only the FIRST response
                             # is covered by the stillborn window
-                    except Exception:
-                        pass
+                    except Exception as _re:
+                        say("[conn %d] reader exit: %s" %
+                            (conn_id, _re))
                     try:
                         client.shutdown(socket.SHUT_RDWR)
                     except Exception:
@@ -1558,74 +1694,163 @@ class WarmSocksServer(SocksServer):
                     while not t.closed and t.channel_open:
                         try:
                             d = client.recv(65536)
-                        except (ConnectionError, socket.timeout, OSError):
-                            # client hung up rudely (RST with unread data) —
-                            # its channel dies, the TUNNEL must not
+                        except (ConnectionError, socket.timeout, OSError) as _we:
+                            say("[conn %d] writer: client error %s" %
+                                (conn_id, _we))
                             break
                         if not d:
+                            say("[conn %d] writer: client EOF" % conn_id)
                             break
                         if wrote[0] is None:
                             wrote[0] = time.monotonic()
+                        _cmd = ""
+                        _smb2_cmd = -1
+                        if len(d) > 16 and d[4:8] == b'\xfeSMB':
+                            _smb2_cmd = struct.unpack_from("<H", d, 16)[0]
+                            _cmd = " SMB2 cmd=%d" % _smb2_cmd
+                        elif len(d) > 8 and d[4:8] == b'\xffSMB':
+                            _cmd = " SMB1"
+                        if _smb2_cmd >= 2 and not host_known:
+                            say("[conn %d] writer: drop %d bytes%s "
+                                "(first-contact gate)" %
+                                (conn_id, len(d), _cmd))
+                            break
+                        say("[conn %d] writer: fwd %d bytes%s" %
+                            (conn_id, len(d), _cmd))
                         t.write(d)
                 finally:
-                    # Quiesce the reader FIRST: it polls on a 1s timeout and
-                    # must be dead before close_channel(), or it races us for
-                    # the 0x11 ack on the shared OUT stream.
+                    # Race the target's close: fire CLOSE_CHANNEL(0)
+                    # immediately so the gateway tears down the channel
+                    # BEFORE the target's FIN/RST arrives. If we win,
+                    # the reader sees 0x11 and the tunnel survives; if
+                    # we lose, the reader sees 0x10/0x800759D8 instead.
+                    preempt_sent = False
+                    _t0 = time.monotonic()
+                    if wrote[0] is None:
+                        say("[conn %d] empty channel — no data sent"
+                            % conn_id)
+                    elif not t.closed and not t._srv_closed_channel \
+                            and t.channel_open \
+                            and hasattr(t, 'send_packet'):
+                        try:
+                            t.send_packet(pkt(0x10, u32(0)))
+                            preempt_sent = True
+                            say("[conn %d] preemptive close sent "
+                                "(%.3fs after writer exit)" %
+                                (conn_id, time.monotonic() - _t0))
+                        except (ConnectionError, ssl.SSLError, OSError):
+                            say("[conn %d] preemptive close FAILED "
+                                "(tunnel already dead)" % conn_id)
+                            t.closed = True
+                    elif t.closed:
+                        say("[conn %d] skipped preempt — tunnel already "
+                            "dead (reader saw abort)" % conn_id)
                     t.channel_open = False
                     rt.join(timeout=10)
                     if rt.is_alive():
                         say("[conn %d] reader stuck — discarding tunnel" %
                             conn_id)
                         t.closed = True
-                        t.suspect = True     # dirty discard, no handshake
+                        t.suspect = True
                         t.close()
                     elif not t.closed and not t._srv_closed_channel:
-                        try:
-                            t._close_channel_xchg()
-                            t.last_close_abrupt = False
-                        except RDGError:
-                            t.closed = True
-                            t.suspect = True   # close handshake failed dirty
+                        if preempt_sent:
+                            _blackhole = (wrote[0] is not None
+                                          and not life[0])
+                            _drain_t = 30 if _blackhole else 5
+                            if _blackhole:
+                                say("[conn %d] blackhole likely — waiting "
+                                    "%ds for gateway TCP timeout"
+                                    % (conn_id, _drain_t))
+                            p = t.recv_packet(timeout=_drain_t)
+                            if p and p[0] == 0x11:
+                                t.last_close_abrupt = False
+                            elif p and p[0] == 0x10:
+                                t._srv_closed_channel = True
+                                t._srv_close_ptype = 0x10
+                                t.last_close_abrupt = True
+                                t.suspect = True
+                                if len(p[1]) >= 4:
+                                    t.last_srv_close_reason = struct.unpack(
+                                        "<I", p[1][:4])[0]
+                                say("[conn %d] cross-close 0x10 in drain "
+                                    "(reason 0x%08x)" %
+                                    (conn_id,
+                                     getattr(t, 'last_srv_close_reason', 0)))
+                                if t.last_srv_close_reason == 0x800759D8:
+                                    t.closed = True
+                            elif p:
+                                say("[conn %d] drain: unexpected ptype "
+                                    "0x%x — tunnel dead" %
+                                    (conn_id, p[0]))
+                                t.closed = True
+                                t.suspect = True
+                            else:
+                                say("[conn %d] drain: no ack after %ds "
+                                    "— tunnel dead" % (conn_id, _drain_t))
+                                t.closed = True
+                                t.suspect = True
+                            if _blackhole:
+                                if self._kill_remember(
+                                        host, port,
+                                        "blackhole (no SMB response)"):
+                                    self.stats["instakill_cached"] += 1
+                                    say("[!] cached %s:%d — blackhole%s"
+                                        % (host, port,
+                                           "" if t.closed
+                                           else " (tunnel survived)"))
+                        else:
+                            try:
+                                t._close_channel_xchg()
+                                t.last_close_abrupt = False
+                            except RDGError:
+                                t.closed = True
+                                t.suspect = True
                     elif not t.closed:
-                        # server already closed the channel (0x10 seen by
-                        # the reader) — its teardown is the slow, racy kind
-                        t.last_close_abrupt = True
-                        t.suspect = True     # delayed-kill precursor: the
-                        # NEXT channel on this tunnel can die for the
-                        # PREVIOUS close, not for its own target
+                        if getattr(t, '_srv_close_ptype', None) == 0x11:
+                            t.last_close_abrupt = False
+                        else:
+                            t.last_close_abrupt = True
+                            t.suspect = True
                     if t.closed:
-                        with self.tunnel_lock:
-                            if self.tunnel is t:
-                                self.tunnel = None
-                    if port == 445 and t.closed and wrote[0] is not None \
+                        if is_scout:
+                            with self.scout_tunnel_lock:
+                                if self.scout is t:
+                                    self.scout = None
+                            self.stats["scout_deaths"] += 1
+                        else:
+                            with self.tunnel_lock:
+                                if self.tunnel is t:
+                                    self.tunnel = None
+                    if t.closed and wrote[0] is not None \
                             and not life[0] \
                             and not getattr(t, "drain_saw_data", False) \
                             and not getattr(t, "suspect", False):
-                        # INSTA-KILL, the real refused wire shape: the tunnel
-                        # RSTs silently right after the create and NO close
-                        # reason is ever delivered (money log: 192.168.15.1,
-                        # 192.168.15.152) — so the gate is reason-agnostic:
-                        # zero response bytes + the client had written + the
-                        # tunnel died with this channel. Suppressed when the
-                        # tunnel was already dirty (suspect: the cause is a
-                        # PRIOR channel's abnormal close, not this host) or
-                        # the tunnel consumed the answer invisibly (close
-                        # drain / mid-body DATA death). A LIVE host that
-                        # answered anything (life[0]) and only aborted later
-                        # (0x800759d8 multi-request) is never cached either.
-                        if self._refused_remember(host,
-                                                  "first-contact RST abort"):
+                        if self._kill_remember(host, port,
+                                               "first-contact RST abort"):
                             self.stats["instakill_cached"] += 1
+                    _abort_reason = getattr(t, "last_srv_close_reason", None)
+                    if is_scout and not t.closed:
+                        self.known_good.add(key)
+                        self.stats["promoted"] += 1
+                    elif use_fb and not is_scout \
+                            and life[0] and not t.closed:
+                        self.known_good.add(key)
+                        say("[conn %d] %s promoted to known_good"
+                            % (conn_id, key))
                     why = ""
-                    r = getattr(t, "last_srv_close_reason", None)
+                    r = _abort_reason
                     if r == 0x800759D8:
-                        why = (" — gateway ABORTED channel: the target "
-                               "closed/reset (multi-request or invalid "
-                               "protocol on this channel kills tunnels)")
+                        why = " — 0x800759D8 TUNNEL DEAD"
                     elif r:
                         why = " — server closed channel (0x%08x)" % r
-                    say("[conn %d] channel closed — tunnel %s%s" %
-                        (conn_id, "dead" if t.closed else "stays warm", why))
+                    ack = getattr(t, '_srv_close_ptype', None)
+                    if ack == 0x11 and not t.closed:
+                        why = " — clean ack (preemptive close won)"
+                    tl = "scout" if is_scout else "tunnel"
+                    say("[conn %d] channel %s:%d closed — %s %s%s" %
+                        (conn_id, host, port, tl,
+                         "dead" if t.closed else "stays warm", why))
         except MfaNotApproved as e:
             self.stats["failed"] += 1
             self._abort(client, replied, 0x02, "mfa not approved: %s" % e)
@@ -1647,9 +1872,14 @@ class WarmSocksServer(SocksServer):
             if t is not None:
                 t.closed = True
                 t.close()
-            with self.tunnel_lock:
-                if self.tunnel is t:
-                    self.tunnel = None
+            if is_scout:
+                with self.scout_tunnel_lock:
+                    if self.scout is t:
+                        self.scout = None
+            else:
+                with self.tunnel_lock:
+                    if self.tunnel is t:
+                        self.tunnel = None
         finally:
             try:
                 client.close()
@@ -1662,24 +1892,28 @@ class WarmSocksServer(SocksServer):
         srv.bind((self.args.socks_host, self.args.socks_port))
         srv.listen(512)   # nxc /24 opens 256 threads; backlog 16 RSTs the
                           # 17th SYN and nxc reports live hosts as down
-        print("[*] SOCKS5 %s:%d via %s:%d as %s — one approval per tunnel, "
-              "sequential channels, SMB1 probes answered locally" %
+        print("[*] SOCKS5 %s:%d via %s:%d as %s" %
               (self.args.socks_host, self.args.socks_port, self.args.gateway,
                self.args.gport, self.args.ident_label), flush=True)
+        try:
+            self._ensure_tunnel()
+        except Exception as e:
+            print("[!] initial tunnel failed: %s — will retry on first "
+                  "connection" % e, flush=True)
         try:
             while True:
                 c, _ = srv.accept()
                 threading.Thread(target=self.handle, args=(c,),
                                  daemon=True).start()
         except KeyboardInterrupt:
-            print("\n[*] opened=%d failed=%d pushes=%d (tunnels paid) "
-                  "smb1_local=%d loopback_local=%d stillborn=%d "
-                  "instakill_cached=%d refused445_cache=%d" %
+            print("\n[*] opened=%d failed=%d pushes=%d "
+                  "smb1_local=%d stillborn=%d instakill=%d "
+                  "kill_cache=%d scout=%d/%d/%d" %
                   (self.stats["opened"], self.stats["failed"],
                    self.stats["pushes"], self.stats["smb1_local"],
-                   self.stats["loopback_local"], self.stats["stillborn"],
-                   self.stats["instakill_cached"],
-                   len(self.stillborn_hosts)))
+                   self.stats["stillborn"], self.stats["instakill_cached"],
+                   len(self.kill_cache), self.stats["scout_probes"],
+                   self.stats["scout_deaths"], self.stats["promoted"]))
 
 
 def check_mode(args):
@@ -1787,6 +2021,17 @@ def parse_args(argv=None):
     ap.add_argument("--mfa-auth-timeout", type=int, default=65,
                     help="seconds to await push approval per attempt "
                          "(default: %(default)s)")
+    ap.add_argument("--no-scout", dest="no_scout", action="store_true",
+                    default=False,
+                    help="disable the scout tunnel — unknown host:port pairs "
+                         "go directly to the warm tunnel (less resilient, "
+                         "legacy single-tunnel behavior)")
+    ap.add_argument("--no-session-reuse", dest="session_reuse",
+                    action="store_false", default=True,
+                    help="disable session/cookie reuse across tunnel rebuilds "
+                         "(by default, cookies and connection IDs from the "
+                         "first MFA-approved tunnel are replayed on rebuilds "
+                         "so the gateway may skip re-prompting MFA)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1815,13 +2060,15 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    jar = {} if getattr(args, "session_reuse", True) else None
 
     def factory(host=None, port=None, auth_timeout=15):
         t = RDGTunnel(args.gateway, args.gport, args.domain, args.user,
                       args.password, nthash=args.nthash, path=args.rdg_path,
                       client_name=args.client_name,
                       connect_timeout=args.timeout, verbose=args.verbose,
-                      ext_auth=args.ext_auth, paa_cookie=args.paa_cookie)
+                      ext_auth=args.ext_auth, paa_cookie=args.paa_cookie,
+                      session_jar=jar)
         if host is not None:
             t.connect_tunnel(host, port, auth_timeout=auth_timeout)
         else:
@@ -1851,7 +2098,7 @@ def main(argv=None):
         except RDGError as e:
             print("[-] %s" % e, file=sys.stderr)
             return 1
-    WarmSocksServer(args, factory).serve()
+    WarmSocksServer(args, factory, scout_factory=factory).serve()
     return 0
 
 
